@@ -1,484 +1,234 @@
+import os
+import random
 import asyncio
+import sqlite3
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-import random
-from collections import defaultdict
-
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
-from aiogram.fsm.state import State, StatesGroup
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.enums import ParseMode
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 
-# Настройка логирования
+# --- 1. НАСТРОЙКА ---
+load_dotenv()
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+PR_CHAT_ID = int(os.getenv("PR_CHAT_ID"))
+LOT_CHANNEL = "@lotsvitechek" # Канал, куда бот будет постить лоты
+
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+bot = Bot(token=TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
 
-# Инициализация бота и диспетчера
-bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
+# --- 2. БАЗА ДАННЫХ ---
+def init_db():
+    with sqlite3.connect("bot_database.db") as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE IF NOT EXISTS participants (user_id INTEGER PRIMARY KEY)")
+        cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
 
-# Хранилище данных (в реальном проекте используйте БД)
-class Storage:
-    def __init__(self):
-        self.giveaways = {}
-        self.participants = defaultdict(set)
-        self.subscription_channels = {}
-        self.user_subscriptions = defaultdict(set)
+def add_participant(user_id):
+    with sqlite3.connect("bot_database.db") as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT OR IGNORE INTO participants (user_id) VALUES (?)", (user_id,))
+        conn.commit()
 
-storage_data = Storage()
+def get_participants():
+    with sqlite3.connect("bot_database.db") as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM participants")
+        return [row[0] for row in cur.fetchall()]
 
-# Состояния для FSM
-class GiveawayStates(StatesGroup):
-    waiting_for_name = State()
-    waiting_for_channels = State()
-    waiting_for_winners_count = State()
+def clear_participants():
+    with sqlite3.connect("bot_database.db") as conn:
+        conn.execute("DELETE FROM participants")
 
-class PRManagerStates(StatesGroup):
-    waiting_for_age = State()
-    waiting_for_nickname = State()
-    waiting_for_chats_count = State()
-    waiting_for_proof = State()
+def set_setting(key, value):
+    with sqlite3.connect("bot_database.db") as conn:
+        conn.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
 
-# Команда /start
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🎁 Участвовать в конкурсе", callback_data="participate"),
-                InlineKeyboardButton(text="📊 Проверить подписки", callback_data="check_subs")
-            ],
-            [
-                InlineKeyboardButton(text="📝 Заявка на пиар-менеджера", callback_data="pr_application"),
-                InlineKeyboardButton(text="👑 Админ панель", callback_data="admin_panel")
-            ]
-        ]
-    )
-    
-    await message.answer(
-        "🎉 Добро пожаловать в бот-рандомайзер для конкурсов!\n\n"
-        "Выберите действие:",
-        reply_markup=keyboard
-    )
+def get_setting(key):
+    with sqlite3.connect("bot_database.db") as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+        res = cur.fetchone()
+        return res[0] if res else None
 
-# Панель администратора
-@dp.callback_query(lambda c: c.data == "admin_panel")
-async def admin_panel(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("У вас нет прав администратора!", show_alert=True)
-        return
-    
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="➕ Создать конкурс", callback_data="create_giveaway"),
-                InlineKeyboardButton(text="🎲 Выбрать победителей", callback_data="select_winners")
-            ],
-            [
-                InlineKeyboardButton(text="📋 Список конкурсов", callback_data="list_giveaways"),
-                InlineKeyboardButton(text="👥 Участники конкурса", callback_data="view_participants")
-            ],
-            [
-                InlineKeyboardButton(text="🔧 Настроить каналы", callback_data="setup_channels"),
-                InlineKeyboardButton(text="📨 Заявки на пиар", callback_data="view_pr_applications")
-            ],
-            [
-                InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")
-            ]
-        ]
-    )
-    
-    await callback.message.edit_text(
-        "👑 Панель администратора\n\n"
-        "Выберите действие:",
-        reply_markup=keyboard
-    )
+# --- 3. СОСТОЯНИЯ (FSM) ---
+class CreateLot(StatesGroup):
+    text = State()
+    channels = State()
 
-# Создание конкурса
-@dp.callback_query(lambda c: c.data == "create_giveaway")
-async def create_giveaway(callback: CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("У вас нет прав!", show_alert=True)
-        return
-    
-    await state.set_state(GiveawayStates.waiting_for_name)
-    await callback.message.edit_text(
-        "Введите название конкурса:"
-    )
+class PRApplication(StatesGroup):
+    age = State()
+    nickname = State()
+    chats_count = State()
+    proofs = State()
 
-@dp.message(GiveawayStates.waiting_for_name)
-async def process_giveaway_name(message: types.Message, state: FSMContext):
-    await state.update_data(giveaway_name=message.text)
-    await state.set_state(GiveawayStates.waiting_for_channels)
-    
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Указать каналы", callback_data="specify_channels"),
-                InlineKeyboardButton(text="❌ Без каналов", callback_data="no_channels")
-            ]
-        ]
-    )
-    
-    await message.answer(
-        "Нужно ли участникам подписываться на каналы?",
-        reply_markup=keyboard
-    )
+# --- 4. КЛАВИАТУРЫ ---
+def get_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎉 Участвовать в розыгрыше", callback_data="participate")],
+        [InlineKeyboardButton(text="💼 Стать PR-менеджером", callback_data="apply_pr")]
+    ])
 
-@dp.callback_query(GiveawayStates.waiting_for_channels)
-async def process_channels_choice(callback: CallbackQuery, state: FSMContext):
-    if callback.data == "no_channels":
-        await state.update_data(channels=[])
-        await state.set_state(GiveawayStates.waiting_for_winners_count)
-        await callback.message.edit_text("Введите количество победителей:")
-    elif callback.data == "specify_channels":
-        await callback.message.edit_text(
-            "Введите ID каналов через запятую (например: -1001234567890, -1009876543210):\n\n"
-            "Как получить ID канала:\n"
-            "1. Добавьте бота в канал\n"
-            "2. Перешлите любое сообщение из канала боту @username_to_id_bot\n"
-            "3. Скопируйте полученный ID"
-        )
+def get_admin_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Создать пост в канал", callback_data="admin_create")],
+        [InlineKeyboardButton(text="🏆 Выбрать победителя (Рандом)", callback_data="admin_draw")],
+        [InlineKeyboardButton(text="🗑 Очистить базу участников", callback_data="admin_clear")]
+    ])
 
-@dp.message(GiveawayStates.waiting_for_channels)
-async def process_channels_input(message: types.Message, state: FSMContext):
-    try:
-        channels = [int(ch.strip()) for ch in message.text.split(',')]
-        await state.update_data(channels=channels)
-        await state.set_state(GiveawayStates.waiting_for_winners_count)
-        await message.answer("Введите количество победителей:")
-    except ValueError:
-        await message.answer("Неверный формат ID каналов. Попробуйте снова:")
+# --- 5. АДМИН-ПАНЕЛЬ И КОНСТРУКТОР ---
 
-@dp.message(GiveawayStates.waiting_for_winners_count)
-async def process_winners_count(message: types.Message, state: FSMContext):
-    try:
-        winners_count = int(message.text)
-        data = await state.get_data()
-        
-        giveaway_id = len(storage_data.giveaways) + 1
-        storage_data.giveaways[giveaway_id] = {
-            'name': data['giveaway_name'],
-            'channels': data.get('channels', []),
-            'winners_count': winners_count,
-            'created_at': datetime.now(),
-            'admin_id': message.from_user.id
-        }
-        
-        storage_data.subscription_channels[giveaway_id] = data.get('channels', [])
-        
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="🔗 Ссылка для участия", 
-                                       url=f"https://t.me/{callback.bot.username}?start=giveaway_{giveaway_id}")
-                ],
-                [
-                    InlineKeyboardButton(text="◀️ В админ панель", callback_data="admin_panel")
-                ]
-            ]
-        )
-        
-        await message.answer(
-            f"🎉 Конкурс создан!\n\n"
-            f"Название: {data['giveaway_name']}\n"
-            f"Каналы для подписки: {len(data.get('channels', []))}\n"
-            f"Количество победителей: {winners_count}\n"
-            f"ID конкурса: {giveaway_id}",
-            reply_markup=keyboard
-        )
-        await state.clear()
-    except ValueError:
-        await message.answer("Введите число!")
+@dp.message(Command("admin"), F.from_user.id.in_(ADMIN_IDS))
+async def cmd_admin(message: Message):
+    await message.answer("🛠 **Панель управления администратора**", reply_markup=get_admin_kb(), parse_mode="Markdown")
 
-# Участие в конкурсе
-@dp.callback_query(lambda c: c.data == "participate")
-async def participate(callback: CallbackQuery):
-    if not storage_data.giveaways:
-        await callback.answer("Нет активных конкурсов!", show_alert=True)
-        return
-    
-    keyboard = InlineKeyboardBuilder()
-    for giveaway_id, giveaway in storage_data.giveaways.items():
-        keyboard.button(
-            text=f"🎁 {giveaway['name']}",
-            callback_data=f"join_{giveaway_id}"
-        )
-    keyboard.adjust(1)
-    
-    await callback.message.edit_text(
-        "Выберите конкурс для участия:",
-        reply_markup=keyboard.as_markup()
-    )
+@dp.callback_query(F.data == "admin_create", F.from_user.id.in_(ADMIN_IDS))
+async def admin_create_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("⌨️ **Отправь текст поста.**\nПоддерживаются: жирный, курсив, ссылки и ПРЕМИУМ ЭМОДЗИ.")
+    await state.set_state(CreateLot.text)
+    await callback.answer()
 
-@dp.callback_query(lambda c: c.data.startswith("join_"))
-async def join_giveaway(callback: CallbackQuery):
-    giveaway_id = int(callback.data.split("_")[1])
-    giveaway = storage_data.giveaways.get(giveaway_id)
-    
-    if not giveaway:
-        await callback.answer("Конкурс не найден!", show_alert=True)
-        return
-    
-    user_id = callback.from_user.id
-    channels = giveaway['channels']
-    
-    # Проверка подписки на каналы
-    if channels:
-        not_subscribed = []
-        for channel_id in channels:
-            try:
-                chat_member = await bot.get_chat_member(channel_id, user_id)
-                if chat_member.status in ['left', 'kicked']:
-                    not_subscribed.append(channel_id)
-            except:
-                not_subscribed.append(channel_id)
-        
-        if not_subscribed:
-            keyboard = InlineKeyboardBuilder()
-            for channel_id in not_subscribed:
-                try:
-                    chat = await bot.get_chat(channel_id)
-                    keyboard.button(
-                        text=f"📢 {chat.title}",
-                        url=f"https://t.me/{chat.username}" if chat.username else f"https://t.me/c/{str(channel_id)[4:]}"
-                    )
-                except:
-                    continue
-            
-            keyboard.button(
-                text="✅ Я подписался",
-                callback_data=f"check_again_{giveaway_id}"
-            )
-            keyboard.adjust(1)
-            
-            await callback.message.edit_text(
-                "Для участия в конкурсе необходимо подписаться на каналы:",
-                reply_markup=keyboard.as_markup()
-            )
-            return
-    
-    # Добавление участника
-    storage_data.participants[giveaway_id].add(user_id)
-    await callback.answer(f"Вы успешно зарегистрированы в конкурсе '{giveaway['name']}'!", show_alert=True)
-    
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="◀️ На главную", callback_data="back_to_main")
-            ]
-        ]
-    )
-    
-    await callback.message.edit_text(
-        f"✅ Вы успешно зарегистрированы в конкурсе '{giveaway['name']}'!\n\n"
-        f"Количество участников: {len(storage_data.participants[giveaway_id])}\n"
-        f"Будет выбрано победителей: {giveaway['winners_count']}",
-        reply_markup=keyboard
-    )
+@dp.message(CreateLot.text)
+async def process_lot_text(message: Message, state: FSMContext):
+    # Сохраняем текст и все "фишки" оформления
+    await state.update_data(text=message.text, entities=message.entities)
+    await message.answer("🔗 **Теперь укажи каналы для подписки через пробел.**\nПример: `@chan1 @chan2` (или напиши `нет`)")
+    await state.set_state(CreateLot.channels)
 
-# Повторная проверка подписки
-@dp.callback_query(lambda c: c.data.startswith("check_again_"))
-async def check_subscriptions_again(callback: CallbackQuery):
-    giveaway_id = int(callback.data.split("_")[2])
-    await join_giveaway(callback)
-
-# Выбор победителей
-@dp.callback_query(lambda c: c.data == "select_winners")
-async def select_winners_menu(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("У вас нет прав!", show_alert=True)
-        return
-    
-    keyboard = InlineKeyboardBuilder()
-    for giveaway_id, giveaway in storage_data.giveaways.items():
-        participants_count = len(storage_data.participants.get(giveaway_id, []))
-        keyboard.button(
-            text=f"{giveaway['name']} ({participants_count} участ.)",
-            callback_data=f"draw_{giveaway_id}"
-        )
-    keyboard.adjust(1)
-    
-    await callback.message.edit_text(
-        "Выберите конкурс для выбора победителей:",
-        reply_markup=keyboard.as_markup()
-    )
-
-@dp.callback_query(lambda c: c.data.startswith("draw_"))
-async def draw_winners(callback: CallbackQuery):
-    giveaway_id = int(callback.data.split("_")[1])
-    giveaway = storage_data.giveaways.get(giveaway_id)
-    
-    if not giveaway:
-        await callback.answer("Конкурс не найден!", show_alert=True)
-        return
-    
-    participants = list(storage_data.participants.get(giveaway_id, []))
-    
-    if len(participants) < giveaway['winners_count']:
-        await callback.answer(f"Недостаточно участников! Только {len(participants)} из {giveaway['winners_count']}", show_alert=True)
-        return
-    
-    winners = random.sample(participants, giveaway['winners_count'])
-    
-    # Формирование списка победителей
-    winners_text = "🎉 Победители конкурса!\n\n"
-    for i, winner_id in enumerate(winners, 1):
-        try:
-            user = await bot.get_chat(winner_id)
-            winners_text += f"{i}. @{user.username or 'без username'} (ID: {winner_id})\n"
-        except:
-            winners_text += f"{i}. ID: {winner_id}\n"
-    
-    winners_text += f"\nКонкурс: {giveaway['name']}"
-    
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="📢 Опубликовать результаты", 
-                                   callback_data=f"publish_results_{giveaway_id}"),
-            ],
-            [
-                InlineKeyboardButton(text="◀️ В админ панель", callback_data="admin_panel")
-            ]
-        ]
-    )
-    
-    await callback.message.edit_text(
-        winners_text,
-        reply_markup=keyboard
-    )
-
-# Заявка на пиар-менеджера
-@dp.callback_query(lambda c: c.data == "pr_application")
-async def pr_application_start(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(PRManagerStates.waiting_for_age)
-    await callback.message.edit_text(
-        "📝 Заявка на позицию пиар-менеджера\n\n"
-        "Введите ваш возраст:"
-    )
-
-@dp.message(PRManagerStates.waiting_for_age)
-async def process_pr_age(message: types.Message, state: FSMContext):
-    await state.update_data(age=message.text)
-    await state.set_state(PRManagerStates.waiting_for_nickname)
-    await message.answer("Введите ваш никнейм (без @):")
-
-@dp.message(PRManagerStates.waiting_for_nickname)
-async def process_pr_nickname(message: types.Message, state: FSMContext):
-    await state.update_data(nickname=message.text)
-    await state.set_state(PRManagerStates.waiting_for_chats_count)
-    await message.answer("В скольки чатах вы можете рекламировать (количество):")
-
-@dp.message(PRManagerStates.waiting_for_chats_count)
-async def process_pr_chats(message: types.Message, state: FSMContext):
-    await state.update_data(chats_count=message.text)
-    await state.set_state(PRManagerStates.waiting_for_proof)
-    await message.answer(
-        "Отправьте доказательства вашей работы:\n"
-        "• Ссылки на отзывы\n"
-        "• Скриншоты\n"
-        "• Примеры работы\n\n"
-        "Можете отправить текст, фото или документы"
-    )
-
-@dp.message(PRManagerStates.waiting_for_proof)
-async def process_pr_proof(message: types.Message, state: FSMContext):
+@dp.message(CreateLot.channels)
+async def process_lot_channels(message: Message, state: FSMContext):
     data = await state.get_data()
+    channels_raw = message.text if message.text.lower() != "нет" else ""
     
-    # Формируем заявку
-    application_text = (
-        "📨 Новая заявка на пиар-менеджера!\n\n"
-        f"👤 Пользователь: {message.from_user.full_name}\n"
-        f"🆔 ID: {message.from_user.id}\n"
-        f"📅 Возраст: {data['age']}\n"
-        f"🏷️ Никнейм: @{data['nickname']}\n"
-        f"📊 Чатов для рекламы: {data['chats_count']}\n"
-        f"📎 Доказательства:"
-    )
-    
-    # Отправляем заявку в PR чат
+    # Сохраняем настройки каналов в БД
+    set_setting("channels", channels_raw.replace(" ", ","))
+    clear_participants() # Новый пост — новая очередь
+
+    # Кнопка для поста в канал
+    bot_user = await bot.get_me()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Участвовать", url=f"https://t.me/{bot_user.username}?start=join")]
+    ])
+
+    # Публикуем
     try:
-        if message.text:
-            await bot.send_message(PR_CHAT_ID, f"{application_text}\n{message.text}")
-        elif message.photo:
-            await bot.send_photo(PR_CHAT_ID, message.photo[-1].file_id, caption=application_text)
-        elif message.document:
-            await bot.send_document(PR_CHAT_ID, message.document.file_id, caption=application_text)
+        await bot.send_message(
+            chat_id=LOT_CHANNEL,
+            text=data['text'],
+            entities=data['entities'],
+            reply_markup=kb
+        )
+        await message.answer(f"🚀 Пост успешно опубликован в {LOT_CHANNEL}!", reply_markup=get_admin_kb())
     except Exception as e:
-        logger.error(f"Error sending PR application: {e}")
+        await message.answer(f"❌ Ошибка публикации: {e}")
     
-    # Создаем инлайн-кнопку для перехода в чат
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="💬 Перейти в чат с заявками", 
-                                   url=f"https://t.me/c/{str(PR_CHAT_ID)[4:]}")
-            ],
-            [
-                InlineKeyboardButton(text="◀️ На главную", callback_data="back_to_main")
-            ]
-        ]
-    )
-    
-    await message.answer(
-        "✅ Ваша заявка отправлена!\n\n"
-        "Администратор свяжется с вами в чате с заявками.",
-        reply_markup=keyboard
-    )
     await state.clear()
 
-# Настройка каналов для подписки
-@dp.callback_query(lambda c: c.data == "setup_channels")
-async def setup_channels(callback: CallbackQuery):
-    if callback.from_user.id not in ADMIN_IDS:
-        await callback.answer("У вас нет прав!", show_alert=True)
-        return
+@dp.callback_query(F.data == "admin_draw", F.from_user.id.in_(ADMIN_IDS))
+async def admin_draw(callback: CallbackQuery):
+    users = get_participants()
+    if not users:
+        return await callback.answer("🤷‍♂️ Участников еще нет!", show_alert=True)
     
-    keyboard = InlineKeyboardBuilder()
-    for giveaway_id, giveaway in storage_data.giveaways.items():
-        channels_count = len(giveaway.get('channels', []))
-        keyboard.button(
-            text=f"{giveaway['name']} ({channels_count} каналов)",
-            callback_data=f"edit_channels_{giveaway_id}"
-        )
-    keyboard.adjust(1)
+    winner_id = random.choice(users)
+    try:
+        chat = await bot.get_chat(winner_id)
+        name = f"@{chat.username}" if chat.username else f"ID: {winner_id}"
+    except:
+        name = f"ID: {winner_id}"
     
-    await callback.message.edit_text(
-        "Выберите конкурс для настройки каналов:",
-        reply_markup=keyboard.as_markup()
+    await callback.message.answer(f"🏆 **Победитель выбран!**\nРезультат: {name}\nВсего было человек: {len(users)}", parse_mode="Markdown")
+    await callback.answer()
+
+@dp.callback_query(F.data == "admin_clear", F.from_user.id.in_(ADMIN_IDS))
+async def admin_clear_db(callback: CallbackQuery):
+    clear_participants()
+    await callback.answer("База участников полностью очищена!", show_alert=True)
+
+# --- 6. ЮЗЕР-ЛОГИКА И ПРОВЕРКИ ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    await message.answer(
+        f"Привет, {message.from_user.first_name}! 👋\nЯ помогу тебе участвовать в розыгрышах.\nИспользуй кнопки ниже:",
+        reply_markup=get_main_kb()
     )
 
-# Обработка остальных callback-ов
-@dp.callback_query(lambda c: c.data == "back_to_main")
-async def back_to_main(callback: CallbackQuery):
-    await cmd_start(callback.message)
+@dp.callback_query(F.data == "participate")
+async def process_participate(callback: CallbackQuery):
+    channels_str = get_setting("channels")
+    channels = channels_str.split(",") if channels_str else []
+    
+    user_id = callback.from_user.id
+    
+    # Проверка подписки
+    for ch in channels:
+        if not ch: continue
+        try:
+            member = await bot.get_chat_member(ch.strip(), user_id)
+            if member.status in ["left", "kicked"]:
+                return await callback.answer(f"❌ Ты не подписан на {ch}!", show_alert=True)
+        except Exception:
+            # Если бот не админ в канале, пропускаем проверку (или выводим ошибку)
+            continue
 
-@dp.callback_query(lambda c: c.data == "check_subs")
-async def check_subs(callback: CallbackQuery):
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_main")
-            ]
-        ]
+    add_participant(user_id)
+    await callback.answer("✅ Ура! Ты в списке участников.", show_alert=True)
+
+# --- 7. PR-АНКЕТА ---
+
+@dp.callback_query(F.data == "apply_pr")
+async def pr_start(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("1️⃣ Напишите ваш возраст:")
+    await state.set_state(PRApplication.age)
+    await callback.answer()
+
+@dp.message(PRApplication.age)
+async def pr_age(message: Message, state: FSMContext):
+    await state.update_data(age=message.text)
+    await message.answer("2️⃣ Ваш ник (как к вам обращаться)?")
+    await state.set_state(PRApplication.nickname)
+
+@dp.message(PRApplication.nickname)
+async def pr_nick(message: Message, state: FSMContext):
+    await state.update_data(nickname=message.text)
+    await message.answer("3️⃣ В сколько чатов раскидываете рекламу?")
+    await state.set_state(PRApplication.chats_count)
+
+@dp.message(PRApplication.chats_count)
+async def pr_chats(message: Message, state: FSMContext):
+    await state.update_data(chats_count=message.text)
+    await message.answer("4️⃣ Пришлите скриншот (пруф):")
+    await state.set_state(PRApplication.proofs)
+
+@dp.message(PRApplication.proofs, F.photo)
+async def pr_done(message: Message, state: FSMContext):
+    data = await state.get_data()
+    user = message.from_user
+    
+    caption = (
+        f"📩 **НОВАЯ ЗАЯВКА НА PR**\n\n"
+        f"👤 Юзер: @{user.username or 'нет'} (ID: `{user.id}`)\n"
+        f"🎂 Возраст: {data['age']}\n"
+        f"🏷 Ник: {data['nickname']}\n"
+        f"📊 Чатов: {data['chats_count']}"
     )
     
-    await callback.message.edit_text(
-        "Эта функция позволяет проверить подписки на все активные каналы.\n"
-        "Для проверки нажмите на кнопку 'Участвовать в конкурсе' и выберите нужный конкурс.",
-        reply_markup=keyboard
-    )
+    await bot.send_photo(PR_CHAT_ID, message.photo[-1].file_id, caption=caption, parse_mode="Markdown")
+    await message.answer("✅ Заявка отправлена админам!")
+    await state.clear()
 
-# Запуск бота
+# --- 8. ЗАПУСК ---
 async def main():
-    logger.info("Starting bot...")
+    init_db()
+    print("Бот запущен и готов к работе!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
