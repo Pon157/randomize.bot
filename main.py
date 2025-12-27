@@ -3,27 +3,27 @@ import random
 import asyncio
 import sqlite3
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 
-# --- 1. НАСТРОЙКА ---
+# --- НАСТРОЙКА ---
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 PR_CHAT_ID = int(os.getenv("PR_CHAT_ID"))
-LOT_CHANNEL = "@lotsvitechek" # Канал, куда бот будет постить лоты
+LOT_CHANNEL = "@lotsvitechek" 
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- 2. БАЗА ДАННЫХ ---
+# --- БАЗА ДАННЫХ ---
 def init_db():
     with sqlite3.connect("bot_database.db") as conn:
         cur = conn.cursor()
@@ -58,10 +58,11 @@ def get_setting(key):
         res = cur.fetchone()
         return res[0] if res else None
 
-# --- 3. СОСТОЯНИЯ (FSM) ---
+# --- СОСТОЯНИЯ ---
 class CreateLot(StatesGroup):
     text = State()
     channels = State()
+    duration = State()
 
 class PRApplication(StatesGroup):
     age = State()
@@ -69,166 +70,139 @@ class PRApplication(StatesGroup):
     chats_count = State()
     proofs = State()
 
-# --- 4. КЛАВИАТУРЫ ---
-def get_main_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎉 Участвовать в розыгрыше", callback_data="participate")],
-        [InlineKeyboardButton(text="💼 Стать PR-менеджером", callback_data="apply_pr")]
-    ])
-
-def get_admin_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Создать пост в канал", callback_data="admin_create")],
-        [InlineKeyboardButton(text="🏆 Выбрать победителя (Рандом)", callback_data="admin_draw")],
-        [InlineKeyboardButton(text="🗑 Очистить базу участников", callback_data="admin_clear")]
-    ])
-
-# --- 5. АДМИН-ПАНЕЛЬ И КОНСТРУКТОР ---
+# --- АДМИНКА ---
 
 @dp.message(Command("admin"), F.from_user.id.in_(ADMIN_IDS))
 async def cmd_admin(message: Message):
-    await message.answer("🛠 **Панель управления администратора**", reply_markup=get_admin_kb(), parse_mode="Markdown")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Создать Лотерею", callback_data="admin_create")],
+        [InlineKeyboardButton(text="🗑 Очистить участников", callback_data="admin_clear")]
+    ])
+    await message.answer("🛠 **Админ-панель**", reply_markup=kb, parse_mode="Markdown")
 
 @dp.callback_query(F.data == "admin_create", F.from_user.id.in_(ADMIN_IDS))
 async def admin_create_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("⌨️ **Отправь текст поста.**\nПоддерживаются: жирный, курсив, ссылки и ПРЕМИУМ ЭМОДЗИ.")
+    await callback.message.answer("1. Отправь текст поста (с премиум эмодзи и т.д.):")
     await state.set_state(CreateLot.text)
     await callback.answer()
 
 @dp.message(CreateLot.text)
-async def process_lot_text(message: Message, state: FSMContext):
-    # Сохраняем текст и все "фишки" оформления
+async def process_text(message: Message, state: FSMContext):
     await state.update_data(text=message.text, entities=message.entities)
-    await message.answer("🔗 **Теперь укажи каналы для подписки через пробел.**\nПример: `@chan1 @chan2` (или напиши `нет`)")
+    await message.answer("2. Укажи каналы через пробел (@chan1 @chan2):")
     await state.set_state(CreateLot.channels)
 
 @dp.message(CreateLot.channels)
-async def process_lot_channels(message: Message, state: FSMContext):
-    data = await state.get_data()
-    channels_raw = message.text if message.text.lower() != "нет" else ""
-    
-    # Сохраняем настройки каналов в БД
-    set_setting("channels", channels_raw.replace(" ", ","))
-    clear_participants() # Новый пост — новая очередь
+async def process_ch(message: Message, state: FSMContext):
+    await state.update_data(channels=message.text.replace(" ", ","))
+    await message.answer("3. Через сколько минут выбрать победителя автоматически?")
+    await state.set_state(CreateLot.duration)
 
-    # Кнопка для поста в канал
+@dp.message(CreateLot.duration)
+async def process_time(message: Message, state: FSMContext):
+    data = await state.get_data()
+    try:
+        minutes = int(message.text)
+    except:
+        return await message.answer("Введи число (минуты)!")
+
+    set_setting("channels", data['channels'])
+    clear_participants()
+    
     bot_user = await bot.get_me()
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Участвовать", url=f"https://t.me/{bot_user.username}?start=join")]
+        [InlineKeyboardButton(text="✅ Участвовать!", url=f"https://t.me/{bot_user.username}?start=join")]
     ])
 
-    # Публикуем
-    try:
-        await bot.send_message(
-            chat_id=LOT_CHANNEL,
-            text=data['text'],
-            entities=data['entities'],
-            reply_markup=kb
-        )
-        await message.answer(f"🚀 Пост успешно опубликован в {LOT_CHANNEL}!", reply_markup=get_admin_kb())
-    except Exception as e:
-        await message.answer(f"❌ Ошибка публикации: {e}")
-    
+    sent_lot = await bot.send_message(LOT_CHANNEL, text=data['text'], entities=data['entities'], reply_markup=kb)
+    await message.answer(f"🚀 Лота запущена на {minutes} мин!")
     await state.clear()
 
-@dp.callback_query(F.data == "admin_draw", F.from_user.id.in_(ADMIN_IDS))
-async def admin_draw(callback: CallbackQuery):
+    # Запускаем таймер завершения
+    await asyncio.sleep(minutes * 60)
+    await finish_giveaway(sent_lot.message_id)
+
+async def finish_giveaway(message_id):
     users = get_participants()
     if not users:
-        return await callback.answer("🤷‍♂️ Участников еще нет!", show_alert=True)
-    
+        await bot.send_message(LOT_CHANNEL, "🔔 Лотерея окончена. Участников не было.", reply_to_message_id=message_id)
+        return
+
     winner_id = random.choice(users)
     try:
         chat = await bot.get_chat(winner_id)
-        name = f"@{chat.username}" if chat.username else f"ID: {winner_id}"
+        winner_mention = f"@{chat.username}" if chat.username else f"[{chat.first_name}](tg://user?id={winner_id})"
     except:
-        name = f"ID: {winner_id}"
-    
-    await callback.message.answer(f"🏆 **Победитель выбран!**\nРезультат: {name}\nВсего было человек: {len(users)}", parse_mode="Markdown")
-    await callback.answer()
+        winner_mention = f"ID: {winner_id}"
 
-@dp.callback_query(F.data == "admin_clear", F.from_user.id.in_(ADMIN_IDS))
-async def admin_clear_db(callback: CallbackQuery):
-    clear_participants()
-    await callback.answer("База участников полностью очищена!", show_alert=True)
+    text = f"🎊 **Итоги розыгрыша!**\n\nПоздравляем нашего победителя: {winner_mention} 🏆\nВсего участников: {len(users)}"
+    await bot.send_message(LOT_CHANNEL, text, parse_mode="Markdown", reply_to_message_id=message_id)
 
-# --- 6. ЮЗЕР-ЛОГИКА И ПРОВЕРКИ ---
+# --- ЛОГИКА ДЛЯ ЮЗЕРОВ ---
 
 @dp.message(Command("start"))
-async def cmd_start(message: Message):
-    await message.answer(
-        f"Привет, {message.from_user.first_name}! 👋\nЯ помогу тебе участвовать в розыгрышах.\nИспользуй кнопки ниже:",
-        reply_markup=get_main_kb()
-    )
+async def cmd_start(message: Message, command: CommandObject):
+    # Если юзер пришел по кнопке из канала
+    if command.args == "join":
+        channels_str = get_setting("channels")
+        channels = channels_str.split(",") if channels_str else []
+        
+        not_subscribed = []
+        for ch in channels:
+            if not ch: continue
+            try:
+                member = await bot.get_chat_member(ch.strip(), message.from_user.id)
+                if member.status in ["left", "kicked"]:
+                    not_subscribed.append(ch)
+            except:
+                continue
 
-@dp.callback_query(F.data == "participate")
-async def process_participate(callback: CallbackQuery):
-    channels_str = get_setting("channels")
-    channels = channels_str.split(",") if channels_str else []
-    
-    user_id = callback.from_user.id
-    
-    # Проверка подписки
-    for ch in channels:
-        if not ch: continue
-        try:
-            member = await bot.get_chat_member(ch.strip(), user_id)
-            if member.status in ["left", "kicked"]:
-                return await callback.answer(f"❌ Ты не подписан на {ch}!", show_alert=True)
-        except Exception:
-            # Если бот не админ в канале, пропускаем проверку (или выводим ошибку)
-            continue
+        if not_subscribed:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Проверить подписку снова", url=f"https://t.me/{(await bot.get_me()).username}?start=join")]])
+            return await message.answer(f"❌ Ты не подписан на:\n" + "\n".join(not_subscribed), reply_markup=kb)
 
-    add_participant(user_id)
-    await callback.answer("✅ Ура! Ты в списке участников.", show_alert=True)
+        add_participant(message.from_user.id)
+        return await message.answer("✅ **Ты успешно зарегистрирован в розыгрыше!**\nЖди результатов в канале.")
 
-# --- 7. PR-АНКЕТА ---
+    # Обычный старт (без кнопки)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💼 Стать PR-менеджером", callback_data="apply_pr")]])
+    await message.answer(f"Привет, {message.from_user.first_name}! Здесь можно подать заявку на PR или участвовать в розыгрышах через наш канал {LOT_CHANNEL}.", reply_markup=kb)
 
+# --- PR АНКЕТА (без изменений) ---
 @dp.callback_query(F.data == "apply_pr")
-async def pr_start(callback: CallbackQuery, state: FSMContext):
-    await callback.message.answer("1️⃣ Напишите ваш возраст:")
+async def pr_start(c: CallbackQuery, state: FSMContext):
+    await c.message.answer("Твой возраст?")
     await state.set_state(PRApplication.age)
-    await callback.answer()
+    await c.answer()
 
 @dp.message(PRApplication.age)
-async def pr_age(message: Message, state: FSMContext):
-    await state.update_data(age=message.text)
-    await message.answer("2️⃣ Ваш ник (как к вам обращаться)?")
+async def pr_age(m: Message, state: FSMContext):
+    await state.update_data(age=m.text)
+    await m.answer("Твой ник?")
     await state.set_state(PRApplication.nickname)
 
 @dp.message(PRApplication.nickname)
-async def pr_nick(message: Message, state: FSMContext):
-    await state.update_data(nickname=message.text)
-    await message.answer("3️⃣ В сколько чатов раскидываете рекламу?")
+async def pr_nick(m: Message, state: FSMContext):
+    await state.update_data(nickname=m.text)
+    await m.answer("Сколько чатов?")
     await state.set_state(PRApplication.chats_count)
 
 @dp.message(PRApplication.chats_count)
-async def pr_chats(message: Message, state: FSMContext):
-    await state.update_data(chats_count=message.text)
-    await message.answer("4️⃣ Пришлите скриншот (пруф):")
+async def pr_chats(m: Message, state: FSMContext):
+    await state.update_data(chats_count=m.text)
+    await m.answer("Скинь скриншот (пруфы):")
     await state.set_state(PRApplication.proofs)
 
 @dp.message(PRApplication.proofs, F.photo)
-async def pr_done(message: Message, state: FSMContext):
+async def pr_done(m: Message, state: FSMContext):
     data = await state.get_data()
-    user = message.from_user
-    
-    caption = (
-        f"📩 **НОВАЯ ЗАЯВКА НА PR**\n\n"
-        f"👤 Юзер: @{user.username or 'нет'} (ID: `{user.id}`)\n"
-        f"🎂 Возраст: {data['age']}\n"
-        f"🏷 Ник: {data['nickname']}\n"
-        f"📊 Чатов: {data['chats_count']}"
-    )
-    
-    await bot.send_photo(PR_CHAT_ID, message.photo[-1].file_id, caption=caption, parse_mode="Markdown")
-    await message.answer("✅ Заявка отправлена админам!")
+    cap = f"📩 PR ЗАЯВКА\nЮзер: @{m.from_user.username}\nВозраст: {data['age']}\nНик: {data['nickname']}\nЧатов: {data['chats_count']}"
+    await bot.send_photo(PR_CHAT_ID, m.photo[-1].file_id, caption=cap)
+    await m.answer("✅ Отправлено!")
     await state.clear()
 
-# --- 8. ЗАПУСК ---
 async def main():
     init_db()
-    print("Бот запущен и готов к работе!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
