@@ -15,9 +15,9 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.enums import ParseMode
 
 # Конфигурация
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-ADMIN_IDS = [123456789]  # ID администраторов
-PR_CHAT_ID = -1001234567890  # ID чата для заявок
+BOT_TOKEN = "8575617408:AAEw8ZIi2_dAlRwbfDCc-OC0lpPvXkRNSgc"
+ADMIN_IDS = [5883703466]  # ID администраторов
+PR_CHAT_ID = -1003411409227  # ID чата для заявок
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
