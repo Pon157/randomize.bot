@@ -126,7 +126,7 @@ async def pr_start(callback: CallbackQuery, state: FSMContext):
 @dp.message(PRApplication.age)
 async def pr_age(message: Message, state: FSMContext):
     await state.update_data(age=message.text)
-    await message.answer("Шаг 2: Твой ник в ТГ?")
+    await message.answer("Шаг 2: Сколько у тебя чатов?")
     await state.set_state(PRApplication.nickname)
 
 @dp.message(PRApplication.nickname)
@@ -138,7 +138,7 @@ async def pr_nick(message: Message, state: FSMContext):
 @dp.message(PRApplication.proofs, F.photo)
 async def pr_end(message: Message, state: FSMContext):
     d = await state.get_data()
-    cap = f"📩 PR ЗАЯВКА: @{message.from_user.username}\nВозраст: {d.get('age')}\nНик: {d.get('nick')}"
+    cap = f"📩 PR ЗАЯВКА: @{message.from_user.username}\nВозраст: {d.get('age')}\nЧатов: {d.get('nick')}"
     await bot.send_photo(PR_CHAT_ID, message.photo[-1].file_id, caption=cap)
     await message.answer("✅ Отправлено!"); await state.clear()
 
