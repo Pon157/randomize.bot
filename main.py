@@ -2,6 +2,7 @@ import os
 import random
 import sqlite3
 import logging
+import asyncio
 import json
 from datetime import datetime
 from dotenv import load_dotenv
