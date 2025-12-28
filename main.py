@@ -4,6 +4,7 @@ import sqlite3
 import logging
 import json
 import asyncio
+import sys
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
@@ -21,100 +22,134 @@ from aiogram.types import (
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# --- 1. ЛОГИРОВАНИЕ И КОНФИГУРАЦИЯ ---
+# =================================================================
+# 1. НАСТРОЙКИ И ЛОГИРОВАНИЕ
+# =================================================================
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
 )
-logger = logging.getLogger("LotteryBotVitechek")
+logger = logging.getLogger("LotterySystemV3")
 
 load_dotenv()
-# Токен берем из .env как и договаривались
+# Токен берется из .env, как ты и просил в сохраненных инструкциях
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 PR_CHAT_ID = int(os.getenv("PR_CHAT_ID", "0"))
 LOT_CHANNEL = os.getenv("LOT_CHANNEL", "@lotsvitechek")
 
+if not TOKEN:
+    logger.error("ОШИБКА: BOT_TOKEN не найден в .env файле!")
+    sys.exit(1)
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# --- 2. ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ---
+# =================================================================
+# 2. БАЗА ДАННЫХ И МИГРАЦИИ
+# =================================================================
 def init_db():
-    """Создание всех необходимых таблиц и выполнение миграций колонок"""
+    """Инициализация структуры базы данных"""
+    logger.info("Проверка и инициализация базы данных...")
     conn = sqlite3.connect("bot_database.db")
     cur = conn.cursor()
     
-    # Лотереи
-    cur.execute("""CREATE TABLE IF NOT EXISTS lotteries (
+    # Таблица розыгрышей
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS lotteries (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        text TEXT, entities TEXT, channels TEXT,
-        finish_type TEXT, finish_value TEXT,
-        status TEXT DEFAULT 'active', message_id INTEGER,
-        photo TEXT, sticker TEXT, winners_count INTEGER DEFAULT 1,
+        text TEXT,
+        entities TEXT,
+        channels TEXT,
+        finish_type TEXT,
+        finish_value TEXT,
+        status TEXT DEFAULT 'active',
+        message_id INTEGER,
+        photo TEXT,
+        sticker TEXT,
+        winners_count INTEGER DEFAULT 1,
         participants_count INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
     
-    # Участники
-    cur.execute("""CREATE TABLE IF NOT EXISTS participants (
-        user_id INTEGER, lot_id INTEGER, username TEXT, full_name TEXT,
+    # Таблица участников
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS participants (
+        user_id INTEGER,
+        lot_id INTEGER,
+        username TEXT,
+        full_name TEXT,
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (user_id, lot_id)
     )""")
     
-    # Победители
-    cur.execute("""CREATE TABLE IF NOT EXISTS winners (
-        lot_id INTEGER, user_id INTEGER, win_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    # Таблица победителей
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS winners (
+        lot_id INTEGER,
+        user_id INTEGER,
+        win_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
     
-    # Отзывы
-    cur.execute("""CREATE TABLE IF NOT EXISTS reviews (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, 
-        lot_id INTEGER, text TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    # Таблица отзывов
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        lot_id INTEGER,
+        text TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
     
-    # Пользователи и реферальная система
-    cur.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY, 
-        username TEXT, 
-        full_name TEXT, 
+    # Таблица пользователей (Реферальная система)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        full_name TEXT,
         referrer_id INTEGER DEFAULT 0,
         refs_count INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )""")
 
-    # Миграция колонок (защита от OperationalError)
-    cur.execute("PRAGMA table_info(lotteries)")
-    l_cols = [c[1] for c in cur.fetchall()]
-    if 'winners_count' not in l_cols: cur.execute("ALTER TABLE lotteries ADD COLUMN winners_count INTEGER DEFAULT 1")
-    if 'photo' not in l_cols: cur.execute("ALTER TABLE lotteries ADD COLUMN photo TEXT")
-    if 'sticker' not in l_cols: cur.execute("ALTER TABLE lotteries ADD COLUMN sticker TEXT")
-    if 'participants_count' not in l_cols: cur.execute("ALTER TABLE lotteries ADD COLUMN participants_count INTEGER DEFAULT 0")
-
+    # ПРОВЕРКА МИГРАЦИЙ (если база старая)
     cur.execute("PRAGMA table_info(users)")
     u_cols = [c[1] for c in cur.fetchall()]
-    if 'referrer_id' not in u_cols: cur.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER DEFAULT 0")
-    if 'refs_count' not in u_cols: cur.execute("ALTER TABLE users ADD COLUMN refs_count INTEGER DEFAULT 0")
-    
+    if 'referrer_id' not in u_cols:
+        logger.info("Миграция: Добавление referrer_id в таблицу users")
+        cur.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER DEFAULT 0")
+    if 'refs_count' not in u_cols:
+        logger.info("Миграция: Добавление refs_count в таблицу users")
+        cur.execute("ALTER TABLE users ADD COLUMN refs_count INTEGER DEFAULT 0")
+
     conn.commit()
     conn.close()
-    logger.info("Система БД готова к работе.")
+    logger.info("База данных готова.")
 
 def db_query(query, params=(), fetchone=False, fetchall=False, commit=False):
-    """Универсальный исполнитель запросов к БД"""
+    """Единый интерфейс для работы с БД"""
     try:
         with sqlite3.connect("bot_database.db") as conn:
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
             cur.execute(query, params)
-            if commit: conn.commit()
-            if fetchone: return cur.fetchone()
-            if fetchall: return cur.fetchall()
+            if commit:
+                conn.commit()
+            if fetchone:
+                return cur.fetchone()
+            if fetchall:
+                return cur.fetchall()
             return cur.lastrowid
     except Exception as e:
-        logger.error(f"БД Ошибка: {e}")
+        logger.error(f"DATABASE ERROR: {e} | Query: {query}")
         return None
 
-# --- 3. FSM КЛАССЫ (СОСТОЯНИЯ) ---
+# =================================================================
+# 3. СОСТОЯНИЯ (FSM)
+# =================================================================
 class CreateLot(StatesGroup):
     text = State()
     winners_count = State()
@@ -134,315 +169,574 @@ class LeaveReview(StatesGroup):
 class BroadcastState(StatesGroup):
     content = State()
 
-# --- 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-async def check_sub_status(user_id: int, channels_str: str):
-    """Проверка подписки на список каналов"""
+class AdminSearch(StatesGroup):
+    user_id = State()
+
+# =================================================================
+# 4. ЛОГИКА РОЗЫГРЫШЕЙ
+# =================================================================
+async def check_user_subscription(user_id: int, channels_str: str):
+    """Проверка подписки на каналы"""
     if not channels_str or channels_str.lower() in ['нет', 'none', '']:
         return True, []
-    not_sub = []
+    
+    not_subscribed = []
     channels = [c.strip() for c in channels_str.split(",") if c.strip()]
-    for ch in channels:
+    
+    for channel in channels:
         try:
-            m = await bot.get_chat_member(ch, user_id)
-            if m.status in ["left", "kicked"]: not_sub.append(ch)
-        except: not_sub.append(ch)
-    return len(not_sub) == 0, not_sub
+            member = await bot.get_chat_member(channel, user_id)
+            if member.status in ["left", "kicked"]:
+                not_subscribed.append(channel)
+        except Exception:
+            not_subscribed.append(channel)
+            
+    return len(not_subscribed) == 0, not_subscribed
 
-async def update_lottery_btn(lot_id: int, count: int):
-    """Обновляет счетчик участников на кнопке в канале"""
+async def update_button_count(lot_id: int, current_count: int):
+    """Обновление счетчика на кнопке в канале"""
     lot = db_query("SELECT message_id FROM lotteries WHERE id = ?", (lot_id,), fetchone=True)
-    if not lot or not lot['message_id']: return
-    kb = InlineKeyboardBuilder()
-    kb.button(text=f"✅ Участвовать! ({count})", url=f"https://t.me/{(await bot.get_me()).username}?start=lot_{lot_id}")
-    try:
-        await bot.edit_message_reply_markup(chat_id=LOT_CHANNEL, message_id=lot['message_id'], reply_markup=kb.as_markup())
-    except: pass
-
-async def finish_lottery(lot_id: int):
-    """Выбор победителей и закрытие лота"""
-    lot = db_query("SELECT * FROM lotteries WHERE id = ?", (lot_id,), fetchone=True)
-    if not lot or lot['status'] == 'closed': return
-    
-    parts = db_query("SELECT * FROM participants WHERE lot_id = ?", (lot_id,), fetchall=True)
-    db_query("UPDATE lotteries SET status = 'closed' WHERE id = ?", (lot_id,), commit=True)
-    
-    if not parts:
-        await bot.send_message(LOT_CHANNEL, f"🔔 Лотерея #{lot_id} завершена. Участников не было.")
+    if not lot or not lot['message_id']:
         return
 
-    win_count = min(len(parts), lot['winners_count'])
-    winners = random.sample(parts, win_count)
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text=f"✅ Участвовать! ({current_count})", 
+        url=f"https://t.me/{(await bot.get_me()).username}?start=lot_{lot_id}"
+    )
     
-    mentions = []
-    for w in winners:
-        db_query("INSERT INTO winners (lot_id, user_id) VALUES (?,?)", (lot_id, w['user_id']), commit=True)
-        name = f"@{w['username']}" if w['username'] else w['full_name']
-        mentions.append(name)
-        try:
-            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✍️ Отзыв", callback_data=f"rev_{lot_id}")]])
-            await bot.send_message(w['user_id'], f"🎊 Победа в лотерее #{lot_id}!", reply_markup=kb)
-        except: pass
-
-    res_txt = f"🎊 **ЛОТЕРЕЯ #{lot_id} ЗАВЕРШЕНА!**\n\n🏆 Победители: {', '.join(mentions)}\n👥 Участников: {len(parts)}"
     try:
-        await bot.send_message(LOT_CHANNEL, res_txt, parse_mode="Markdown", reply_to_message_id=lot['message_id'])
-    except:
-        await bot.send_message(LOT_CHANNEL, res_txt, parse_mode="Markdown")
+        await bot.edit_message_reply_markup(
+            chat_id=LOT_CHANNEL, 
+            message_id=lot['message_id'], 
+            reply_markup=kb.as_markup()
+        )
+    except Exception as e:
+        logger.debug(f"Кнопка не обновилась (возможно нет изменений): {e}")
 
-# --- 5. ОБРАБОТЧИКИ КНОПОК МЕНЮ ---
-
-@dp.callback_query(F.data == "my_stats")
-async def show_profile(c: CallbackQuery):
-    uid = c.from_user.id
-    u = db_query("SELECT * FROM users WHERE user_id = ?", (uid,), fetchone=True)
-    p = db_query("SELECT COUNT(*) as c FROM participants WHERE user_id = ?", (uid,), fetchone=True)['c']
-    w = db_query("SELECT COUNT(*) as c FROM winners WHERE user_id = ?", (uid,), fetchone=True)['c']
+async def finalize_giveaway(lot_id: int):
+    """Завершение розыгрыша и выбор победителей"""
+    lot = db_query("SELECT * FROM lotteries WHERE id = ?", (lot_id,), fetchone=True)
+    if not lot or lot['status'] == 'closed':
+        return
     
-    me = await bot.get_me()
-    ref_link = f"https://t.me/{me.username}?start=ref{uid}"
+    participants = db_query("SELECT * FROM participants WHERE lot_id = ?", (lot_id,), fetchall=True)
+    db_query("UPDATE lotteries SET status = 'closed' WHERE id = ?", (lot_id,), commit=True)
     
-    txt = (f"👤 **Ваш профиль**\n\n🆔 ID: `{uid}`\n🎫 Участий: {p}\n🏆 Побед: {w}\n"
-           f"👥 Рефералов: {u['refs_count'] if u else 0}\n\n🔗 **Ссылка:**\n`{ref_link}`")
-    await c.message.answer(txt, parse_mode="Markdown")
-    await c.answer()
+    if not participants:
+        await bot.send_message(LOT_CHANNEL, f"🔔 Розыгрыш #{lot_id} завершен, но участников не было.")
+        return
 
-@dp.callback_query(F.data == "active_lots")
-async def show_lots(c: CallbackQuery):
-    lots = db_query("SELECT * FROM lotteries WHERE status = 'active' ORDER BY id DESC", fetchall=True)
-    if not lots: return await c.answer("Активных лотов нет!", show_alert=True)
+    # Выбор случайных победителей
+    count_to_pick = min(len(participants), lot['winners_count'])
+    winners = random.sample(participants, count_to_pick)
     
-    msg = "📢 **Активные лотереи:**\n\n"
-    for l in lots:
-        msg += f"🔹 Лот #{l['id']} | 👥 {l['participants_count']} чел.\n"
-    await c.message.answer(msg, parse_mode="Markdown")
-    await c.answer()
+    winner_mentions = []
+    for winner in winners:
+        db_query("INSERT INTO winners (lot_id, user_id) VALUES (?,?)", (lot_id, winner['user_id']), commit=True)
+        mention = f"@{winner['username']}" if winner['username'] else f"[{winner['full_name']}](tg://user?id={winner['user_id']})"
+        winner_mentions.append(mention)
+        
+        try:
+            # Кнопка для отзыва победителя
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✍️ Оставить отзыв", callback_data=f"rev_{lot_id}")]
+            ])
+            await bot.send_message(
+                winner['user_id'], 
+                f"🎉 Поздравляем! Вы стали победителем в розыгрыше #{lot_id}!", 
+                reply_markup=kb
+            )
+        except Exception:
+            pass
 
-# --- 6. КОМАНДА /START И РЕФЕРАЛЫ ---
+    result_msg = (
+        f"🎊 **ИТОГИ РОЗЫГРЫША #{lot_id}**\n\n"
+        f"🏆 Победители: {', '.join(winner_mentions)}\n"
+        f"📊 Всего участников: {len(participants)}\n\n"
+        f"Победители, бот отписал вам в ЛС!"
+    )
+    
+    try:
+        await bot.send_message(LOT_CHANNEL, result_msg, parse_mode="Markdown", reply_to_message_id=lot['message_id'])
+    except Exception:
+        await bot.send_message(LOT_CHANNEL, result_msg, parse_mode="Markdown")
 
+# =================================================================
+# 5. КОМАНДА START И РЕФЕРАЛЬНЫЙ МОДУЛЬ
+# =================================================================
 @dp.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
     uid = message.from_user.id
     args = command.args
+    logger.info(f"User {uid} started bot with args: {args}")
     
-    # Регистрация и реф-система
-    user = db_query("SELECT * FROM users WHERE user_id = ?", (uid,), fetchone=True)
-    if not user:
+    # Регистрация нового пользователя и реферальная логика
+    user_data = db_query("SELECT * FROM users WHERE user_id = ?", (uid,), fetchone=True)
+    if not user_data:
         ref_id = 0
         if args and args.startswith("ref"):
             try:
                 ref_id = int(args.replace("ref", ""))
                 if ref_id == uid: ref_id = 0
-            except: pass
-        
-        db_query("INSERT INTO users (user_id, username, full_name, referrer_id) VALUES (?,?,?,?)",
-                 (uid, message.from_user.username, message.from_user.full_name, ref_id), commit=True)
+            except:
+                ref_id = 0
+            
+        db_query(
+            "INSERT INTO users (user_id, username, full_name, referrer_id) VALUES (?,?,?,?)",
+            (uid, message.from_user.username, message.from_user.full_name, ref_id),
+            commit=True
+        )
         
         if ref_id != 0:
             # Обновляем счетчик пригласившего
             db_query("UPDATE users SET refs_count = refs_count + 1 WHERE user_id = ?", (ref_id,), commit=True)
-            ref_data = db_query("SELECT * FROM users WHERE user_id = ?", (ref_id,), fetchone=True)
+            inviter = db_query("SELECT * FROM users WHERE user_id = ?", (ref_id,), fetchone=True)
             
-            # УВЕДОМЛЕНИЕ В PR ЧАТ
+            # 1. Сообщение новому пользователю
+            inviter_name = inviter['full_name'] if inviter else "Партнер"
+            await message.answer(f"🤝 Привет! Вы приглашены пользователем **{inviter_name}**")
+            
+            # 2. Сообщение пригласившему
+            try:
+                await bot.send_message(ref_id, f"🤝 По вашей ссылке зарегистрировался новый пользователь: **{message.from_user.full_name}**")
+            except:
+                pass
+            
+            # 3. Отчет в PR чат
             if PR_CHAT_ID:
-                pr_msg = (f"🤝 **Новый реферал!**\n\n"
-                          f"👤 Кто пригласил: @{ref_data['username'] or ref_data['full_name']} (ID: `{ref_id}`)\n"
-                          f"🆕 Кто пришел: @{message.from_user.username or message.from_user.full_name}\n"
-                          f"📊 Всего рефералов у партнера: **{ref_data['refs_count']}**")
-                try: await bot.send_message(PR_CHAT_ID, pr_msg, parse_mode="Markdown")
-                except: pass
-            
-            try: await bot.send_message(ref_id, "🤝 У вас новый реферал!")
-            except: pass
+                pr_log = (
+                    f"📈 **НОВЫЙ РЕФЕРАЛ**\n\n"
+                    f"👤 Партнер: {inviter['full_name']} (ID: `{ref_id}`)\n"
+                    f"🆕 Игрок: {message.from_user.full_name} (ID: `{uid}`)\n"
+                    f"📊 Всего рефералов у партнера: **{inviter['refs_count'] + 1}**"
+                )
+                try:
+                    await bot.send_message(PR_CHAT_ID, pr_log, parse_mode="Markdown")
+                except:
+                    pass
 
-    # Если вход для участия
+    # Обработка входа для участия в лотерее
     if args and args.startswith("lot_"):
-        lid = int(args.split("_")[1])
-        lot = db_query("SELECT * FROM lotteries WHERE id = ?", (lid,), fetchone=True)
-        if not lot or lot['status'] == 'closed': return await message.answer("❌ Завершено.")
-        
-        sub_ok, channels = await check_sub_status(uid, lot['channels'])
-        if not sub_ok:
-            kb = InlineKeyboardBuilder()
-            for ch in channels: kb.button(text=f"📢 {ch}", url=f"https://t.me/{ch.lstrip('@')}")
-            kb.button(text="🔄 Проверить", url=f"https://t.me/{(await bot.get_me()).username}?start=lot_{lid}")
-            return await message.answer("⚠️ Подпишись на каналы:", reply_markup=kb.adjust(1).as_markup())
-
         try:
-            db_query("INSERT INTO participants (user_id, lot_id, username, full_name) VALUES (?,?,?,?)", 
-                     (uid, lid, message.from_user.username, message.from_user.full_name), commit=True)
-            cnt = db_query("SELECT COUNT(*) as c FROM participants WHERE lot_id = ?", (lid,), fetchone=True)['c']
-            db_query("UPDATE lotteries SET participants_count = ? WHERE id = ?", (cnt, lid), commit=True)
-            await update_lottery_btn(lid, cnt)
-            if lot['finish_type'] == 'count' and cnt >= int(lot['finish_value']): await finish_lottery(lid)
-            await message.answer(f"✅ Ты участвуешь в лотерее #{lid}!")
-        except: await message.answer("✅ Ты уже зарегистрирован!")
-        return
+            lot_id = int(args.split("_")[1])
+            lot = db_query("SELECT * FROM lotteries WHERE id = ?", (lot_id,), fetchone=True)
+            
+            if not lot or lot['status'] == 'closed':
+                return await message.answer("❌ Этот розыгрыш уже завершен.")
+            
+            # Проверка подписки
+            sub_ok, channels = await check_user_subscription(uid, lot['channels'])
+            if not sub_ok:
+                builder = InlineKeyboardBuilder()
+                for ch in channels:
+                    builder.button(text=f"📢 Подписаться на {ch}", url=f"https://t.me/{ch.lstrip('@')}")
+                builder.button(text="🔄 Я подписался!", url=f"https://t.me/{(await bot.get_me()).username}?start=lot_{lot_id}")
+                return await message.answer(
+                    "⚠️ Для участия необходимо подписаться на наши каналы:", 
+                    reply_markup=builder.adjust(1).as_markup()
+                )
 
-    # Главное меню
+            # Регистрация участия
+            try:
+                db_query(
+                    "INSERT INTO participants (user_id, lot_id, username, full_name) VALUES (?,?,?,?)",
+                    (uid, lot_id, message.from_user.username, message.from_user.full_name),
+                    commit=True
+                )
+                # Обновляем счетчик
+                res = db_query("SELECT COUNT(*) as cnt FROM participants WHERE lot_id = ?", (lot_id,), fetchone=True)
+                new_count = res['cnt']
+                db_query("UPDATE lotteries SET participants_count = ? WHERE id = ?", (new_count, lot_id), commit=True)
+                
+                await update_button_count(lot_id, new_count)
+                
+                # Проверка финиша по количеству
+                if lot['finish_type'] == 'count' and new_count >= int(lot['finish_value']):
+                    await finalize_giveaway(lot_id)
+                
+                await message.answer(f"✅ Вы успешно зарегистрированы в лотерее #{lot_id}!")
+            except sqlite3.IntegrityError:
+                await message.answer("✅ Вы уже участвуете в этой лотерее!")
+            return
+        except Exception as e:
+            logger.error(f"Ошибка при входе в лот: {e}")
+
+    # Обычное главное меню
     kb = [
-        [InlineKeyboardButton(text="💬 Отзывы", callback_data="view_reviews"), InlineKeyboardButton(text="💼 PR Заявка", callback_data="apply_pr")],
-        [InlineKeyboardButton(text="📢 Розыгрыши", callback_data="active_lots"), InlineKeyboardButton(text="📊 Мой профиль", callback_data="my_stats")]
+        [InlineKeyboardButton(text="💬 Отзывы", callback_data="view_reviews"), 
+         InlineKeyboardButton(text="💼 PR Заявка", callback_data="apply_pr")],
+        [InlineKeyboardButton(text="📢 Розыгрыши", callback_data="active_lots"), 
+         InlineKeyboardButton(text="📊 Мой профиль", callback_data="my_stats")]
     ]
     if uid in ADMIN_IDS:
         kb.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_main")])
     
-    await message.answer(f"👋 Привет, {message.from_user.first_name}!", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await message.answer(
+        f"👋 Привет, {message.from_user.first_name}!\nРады видеть тебя в нашем боте розыгрышей.", 
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb)
+    )
 
-# --- 7. АДМИН-ПАНЕЛЬ (РАССЫЛКА ТЕПЕРЬ ТУТ) ---
-
-@dp.callback_query(F.data == "admin_main")
-async def adm_menu(c: CallbackQuery):
-    if c.from_user.id not in ADMIN_IDS: return
+# =================================================================
+# 6. ЛИЧНЫЙ КАБИНЕТ И СПИСОК РЕФЕРАЛОВ
+# =================================================================
+@dp.callback_query(F.data == "my_stats")
+async def process_my_stats(c: CallbackQuery):
+    uid = c.from_user.id
+    user = db_query("SELECT * FROM users WHERE user_id = ?", (uid,), fetchone=True)
+    
+    # Статистика из БД
+    participations = db_query("SELECT COUNT(*) as c FROM participants WHERE user_id = ?", (uid,), fetchone=True)['c']
+    wins = db_query("SELECT COUNT(*) as c FROM winners WHERE user_id = ?", (uid,), fetchone=True)['c']
+    
+    me = await bot.get_me()
+    ref_link = f"https://t.me/{me.username}?start=ref{uid}"
+    
+    text = (
+        f"👤 **ВАШ ПРОФИЛЬ**\n\n"
+        f"🆔 Твой Telegram ID: `{uid}`\n"
+        f"🎟 Участий в лотереях: **{participations}**\n"
+        f"🏆 Количество побед: **{wins}**\n"
+        f"👥 Приглашено друзей: **{user['refs_count'] if user else 0}**\n\n"
+        f"🔗 **Твоя реферальная ссылка:**\n`{ref_link}`"
+    )
+    
     kb = [
-        [InlineKeyboardButton(text="➕ Создать лот", callback_data="adm_create")],
-        [InlineKeyboardButton(text="📩 Рассылка по всем", callback_data="adm_broadcast")],
-        [InlineKeyboardButton(text="📝 Список лотов", callback_data="adm_list")],
+        [InlineKeyboardButton(text="👥 Список моих рефералов", callback_data="my_refs_list")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="to_start")]
     ]
-    await c.message.edit_text("🛠 **Панель администратора**", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
+    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="Markdown")
 
-@dp.callback_query(F.data == "adm_broadcast")
-async def adm_broad_step1(c: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "my_refs_list")
+async def process_my_refs_list(c: CallbackQuery):
+    uid = c.from_user.id
+    refs = db_query(
+        "SELECT full_name, username, created_at FROM users WHERE referrer_id = ? ORDER BY created_at DESC LIMIT 30", 
+        (uid,), fetchall=True
+    )
+    
+    if not refs:
+        return await c.answer("У вас пока нет рефералов. Пригласите друзей!", show_alert=True)
+    
+    msg = "👥 **ВАШИ РЕФЕРАЛЫ (последние 30):**\n\n"
+    for i, r in enumerate(refs, 1):
+        name = r['full_name']
+        username = f" (@{r['username']})" if r['username'] else ""
+        date = r['created_at'].split()[0]
+        msg += f"{i}. {name}{username} — _{date}_\n"
+    
+    await c.message.answer(msg, parse_mode="Markdown")
+    await c.answer()
+
+# =================================================================
+# 7. АДМИНИСТРАТИВНЫЙ МОДУЛЬ (ПОИСК, ЛОТЫ, РАССЫЛКА)
+# =================================================================
+@dp.callback_query(F.data == "admin_main")
+async def process_admin_menu(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS:
+        return await c.answer("⛔ Доступ только для администраторов!", show_alert=True)
+        
+    kb = [
+        [InlineKeyboardButton(text="➕ Создать новый лот", callback_data="adm_create")],
+        [InlineKeyboardButton(text="📩 Сделать рассылку", callback_data="adm_broadcast")],
+        [InlineKeyboardButton(text="🔍 Информация о юзере", callback_data="adm_search_user")],
+        [InlineKeyboardButton(text="📊 Общая статистика", callback_data="adm_global_stats")],
+        [InlineKeyboardButton(text="🔙 Выход в меню", callback_data="to_start")]
+    ]
+    await c.message.edit_text("🛠 **ПАНЕЛЬ УПРАВЛЕНИЯ**", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "adm_global_stats")
+async def process_global_stats(c: CallbackQuery):
     if c.from_user.id not in ADMIN_IDS: return
-    await state.set_state(BroadcastState.content)
-    await c.message.answer("📣 Отправь сообщение (текст/фото) для рассылки всем юзерам:")
+    
+    total_users = db_query("SELECT COUNT(*) as c FROM users", fetchone=True)['c']
+    active_lots = db_query("SELECT COUNT(*) as c FROM lotteries WHERE status='active'", fetchone=True)['c']
+    total_reviews = db_query("SELECT COUNT(*) as c FROM reviews", fetchone=True)['c']
+    
+    txt = (
+        f"📊 **ГЛОБАЛЬНАЯ СТАТИСТИКА**\n\n"
+        f"👤 Всего пользователей в БД: **{total_users}**\n"
+        f"📢 Активных розыгрышей: **{active_lots}**\n"
+        f"💬 Всего отзывов: **{total_reviews}**"
+    )
+    await c.message.answer(txt, parse_mode="Markdown")
+    await c.answer()
 
-@dp.message(BroadcastState.content)
-async def adm_broad_step2(m: Message, state: FSMContext):
-    users = db_query("SELECT user_id FROM users", fetchall=True)
-    await m.answer(f"🚀 Запускаю рассылку на {len(users)} чел...")
-    ok, err = 0, 0
-    for u in users:
-        try:
-            await m.copy_to(u['user_id'])
-            ok += 1
-            await asyncio.sleep(0.05)
-        except: err += 1
-    await m.answer(f"🏁 Итог: ✅ {ok} | ❌ {err}")
+@dp.callback_query(F.data == "adm_search_user")
+async def process_adm_search_user(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMIN_IDS: return
+    await state.set_state(AdminSearch.user_id)
+    await c.message.answer("Введите Telegram ID пользователя для детальной проверки:")
+
+@dp.message(AdminSearch.user_id)
+async def process_adm_search_id(m: Message, state: FSMContext):
+    if not m.text.isdigit():
+        return await m.answer("ID должен состоять только из цифр!")
+        
+    target_id = int(m.text)
+    user = db_query("SELECT * FROM users WHERE user_id = ?", (target_id,), fetchone=True)
+    
+    if not user:
+        return await m.answer("❌ Пользователь не найден в базе данных.")
+    
+    # Сбор данных
+    p_count = db_query("SELECT COUNT(*) as c FROM participants WHERE user_id = ?", (target_id,), fetchone=True)['c']
+    w_count = db_query("SELECT COUNT(*) as c FROM winners WHERE user_id = ?", (target_id,), fetchone=True)['c']
+    refs = db_query("SELECT full_name, user_id FROM users WHERE referrer_id = ?", (target_id,), fetchall=True)
+    
+    report = (
+        f"🔍 **ОТЧЕТ ПО ПОЛЬЗОВАТЕЛЮ `{target_id}`**\n\n"
+        f"👤 Имя: {user['full_name']}\n"
+        f"🔗 Юзер: @{user['username'] if user['username'] else 'нет'}\n"
+        f"📅 В базе с: {user['created_at']}\n"
+        f"🎟 Участий: {p_count} | 🏆 Побед: {w_count}\n"
+        f"👥 Пригласил рефералов: **{len(refs)}**\n\n"
+        f"📋 **Список рефералов:**\n"
+    )
+    
+    if refs:
+        report += ", ".join([r['full_name'] for r in refs])
+    else:
+        report += "Список пуст."
+        
+    await m.answer(report)
     await state.clear()
 
-# --- 8. СОЗДАНИЕ ЛОТА ---
+@dp.callback_query(F.data == "adm_broadcast")
+async def process_broadcast_start(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMIN_IDS: return
+    await state.set_state(BroadcastState.content)
+    await c.message.answer("📣 Отправьте сообщение (текст/фото/видео), которое нужно разослать всем:")
 
+@dp.message(BroadcastState.content)
+async def process_broadcast_send(m: Message, state: FSMContext):
+    all_users = db_query("SELECT user_id FROM users", fetchall=True)
+    await m.answer(f"🚀 Начинаю рассылку на {len(all_users)} пользователей...")
+    
+    count_ok = 0
+    count_err = 0
+    
+    for user in all_users:
+        try:
+            await m.copy_to(user['user_id'])
+            count_ok += 1
+            await asyncio.sleep(0.05) # Плавность
+        except:
+            count_err += 1
+            
+    await m.answer(f"🏁 Рассылка завершена!\n✅ Успешно: {count_ok}\n❌ Ошибок: {count_err}")
+    await state.clear()
+
+# =================================================================
+# 8. СОЗДАНИЕ РОЗЫГРЫША (ПОШАГОВО)
+# =================================================================
 @dp.callback_query(F.data == "adm_create")
-async def adm_c1(c: CallbackQuery, state: FSMContext):
+async def adm_create_lot_1(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMIN_IDS: return
     await state.set_state(CreateLot.text)
-    await c.message.answer("1️⃣ Отправь пост (Текст, Фото или Стикер):")
+    await c.message.answer("Шаг 1: Пришлите содержимое поста (текст, фото с описанием или стикер):")
 
 @dp.message(CreateLot.text)
-async def adm_c2(m: Message, state: FSMContext):
+async def adm_create_lot_2(m: Message, state: FSMContext):
+    entities_json = "[]"
+    if m.entities:
+        entities_json = json.dumps([e.model_dump(mode='json') for e in m.entities])
+    elif m.caption_entities:
+        entities_json = json.dumps([e.model_dump(mode='json') for e in m.caption_entities])
+
     data = {
         "text": m.caption or m.text or "",
-        "entities": json.dumps([e.model_dump(mode='json') for e in (m.entities or m.caption_entities or [])]),
+        "entities": entities_json,
         "photo": m.photo[-1].file_id if m.photo else None,
         "sticker": m.sticker.file_id if m.sticker else None
     }
-    await state.update_data(post=data)
+    await state.update_data(post_data=data)
     await state.set_state(CreateLot.winners_count)
-    await m.answer("2️⃣ Сколько победителей?")
+    await m.answer("Шаг 2: Сколько будет победителей? (введите число)")
 
 @dp.message(CreateLot.winners_count)
-async def adm_c3(m: Message, state: FSMContext):
-    if not m.text.isdigit(): return await m.answer("Введи число!")
+async def adm_create_lot_3(m: Message, state: FSMContext):
+    if not m.text.isdigit():
+        return await m.answer("Введите именно число!")
     await state.update_data(wc=int(m.text))
     await state.set_state(CreateLot.channels)
-    await m.answer("3️⃣ Каналы через запятую (@chan1, @chan2) или 'нет':")
+    await m.answer("Шаг 3: Каналы для ОП через запятую (напр. @chan1, @chan2) или 'нет':")
 
 @dp.message(CreateLot.channels)
-async def adm_c4(m: Message, state: FSMContext):
+async def adm_create_lot_4(m: Message, state: FSMContext):
     await state.update_data(ch=m.text)
-    kb = [[InlineKeyboardButton(text="⏰ Время", callback_data="set_t"), InlineKeyboardButton(text="👥 Кол-во", callback_data="set_c")]]
-    await m.answer("4️⃣ Тип финиша:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    kb = [
+        [InlineKeyboardButton(text="⏰ По времени", callback_data="type_time"), 
+         InlineKeyboardButton(text="👥 По количеству", callback_data="type_count")]
+    ]
+    await m.answer("Шаг 4: Выберите условие завершения:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@dp.callback_query(F.data.startswith("set_"))
-async def adm_c5(c: CallbackQuery, state: FSMContext):
-    t = c.data.split("_")[1]
-    await state.update_data(ft="time" if t=="t" else "count")
-    await c.message.answer("Введите значение (часы или число участников):")
+@dp.callback_query(F.data.startswith("type_"))
+async def adm_create_lot_5(c: CallbackQuery, state: FSMContext):
+    finish_type = c.data.split("_")[1]
+    await state.update_data(ft=finish_type)
+    
+    prompt = "Через сколько ЧАСОВ завершить?" if finish_type == "time" else "При скольки УЧАСТНИКАХ завершить?"
+    await c.message.answer(prompt)
     await state.set_state(CreateLot.value)
 
 @dp.message(CreateLot.value)
-async def adm_c_final(m: Message, state: FSMContext):
-    if not m.text.isdigit(): return await m.answer("Введи число!")
-    s = await state.get_data()
-    post = s['post']
-    val = (datetime.now() + timedelta(hours=int(m.text))).strftime("%d.%m.%Y %H:%M") if s['ft'] == 'time' else m.text
+async def adm_create_lot_final(m: Message, state: FSMContext):
+    if not m.text.isdigit():
+        return await m.answer("Введите число!")
     
-    lid = db_query("INSERT INTO lotteries (text, entities, channels, finish_type, finish_value, photo, sticker, winners_count) VALUES (?,?,?,?,?,?,?,?)",
-                   (post['text'], post['entities'], s['ch'], s['ft'], val, post['photo'], post['sticker'], s['wc']), commit=True)
+    user_data = await state.get_data()
+    post = user_data['post_data']
     
-    kb = InlineKeyboardBuilder().button(text="✅ Участвовать! (0)", url=f"https://t.me/{(await bot.get_me()).username}?start=lot_{lid}")
-    if post['photo']: sent = await bot.send_photo(LOT_CHANNEL, post['photo'], caption=post['text'], reply_markup=kb.as_markup())
-    elif post['sticker']: 
-        await bot.send_sticker(LOT_CHANNEL, post['sticker'])
-        sent = await bot.send_message(LOT_CHANNEL, "🎁 Новый розыгрыш!", reply_markup=kb.as_markup())
-    else: sent = await bot.send_message(LOT_CHANNEL, post['text'], reply_markup=kb.as_markup())
+    final_val = m.text
+    if user_data['ft'] == "time":
+        final_val = (datetime.now() + timedelta(hours=int(m.text))).strftime("%d.%m.%Y %H:%M")
+
+    # Сохранение в БД
+    lid = db_query(
+        "INSERT INTO lotteries (text, entities, channels, finish_type, finish_value, photo, sticker, winners_count) VALUES (?,?,?,?,?,?,?,?)",
+        (post['text'], post['entities'], user_data['ch'], user_data['ft'], final_val, post['photo'], post['sticker'], user_data['wc']),
+        commit=True
+    )
     
-    db_query("UPDATE lotteries SET message_id = ? WHERE id = ?", (sent.message_id, lid), commit=True)
-    await m.answer(f"✅ Лот #{lid} опубликован!")
+    # Публикация в канал
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Участвовать! (0)", url=f"https://t.me/{(await bot.get_me()).username}?start=lot_{lid}")
+    
+    try:
+        if post['photo']:
+            sent = await bot.send_photo(LOT_CHANNEL, post['photo'], caption=post['text'], reply_markup=kb.as_markup())
+        elif post['sticker']:
+            await bot.send_sticker(LOT_CHANNEL, post['sticker'])
+            sent = await bot.send_message(LOT_CHANNEL, "🎁 Участвуй в новом розыгрыше!", reply_markup=kb.as_markup())
+        else:
+            sent = await bot.send_message(LOT_CHANNEL, post['text'], reply_markup=kb.as_markup())
+        
+        db_query("UPDATE lotteries SET message_id = ? WHERE id = ?", (sent.message_id, lid), commit=True)
+        await m.answer(f"✅ Лотерея #{lid} успешно создана и опубликована в канале!")
+    except Exception as e:
+        await m.answer(f"❌ Ошибка публикации: {e}")
+    
     await state.clear()
 
-# --- 9. PR И ОТЗЫВЫ ---
+# =================================================================
+# 9. КНОПКИ ГЛАВНОГО МЕНЮ И ОТЗЫВЫ
+# =================================================================
+@dp.callback_query(F.data == "active_lots")
+async def process_active_lots(c: CallbackQuery):
+    lots = db_query("SELECT * FROM lotteries WHERE status = 'active'", fetchall=True)
+    if not lots:
+        return await c.answer("Сейчас нет активных розыгрышей.", show_alert=True)
+    
+    res = "📢 **АКТИВНЫЕ РОЗЫГРЫШИ:**\n\n"
+    for l in lots:
+        res += f"🔹 Лот #{l['id']} | Участников: {l['participants_count']} | Мест: {l['winners_count']}\n"
+    
+    await c.message.answer(res, parse_mode="Markdown")
+    await c.answer()
+
+@dp.callback_query(F.data == "view_reviews")
+async def process_view_reviews(c: CallbackQuery):
+    reviews = db_query(
+        "SELECT r.*, u.full_name FROM reviews r JOIN users u ON r.user_id = u.user_id ORDER BY r.id DESC LIMIT 10", 
+        fetchall=True
+    )
+    if not reviews:
+        return await c.answer("Отзывов пока нет.", show_alert=True)
+    
+    out = "💬 **ОТЗЫВЫ ПОБЕДИТЕЛЕЙ:**\n\n"
+    for r in reviews:
+        out += f"👤 {r['full_name']} (Лот #{r['lot_id']}):\n«{r['text']}»\n{'-'*20}\n"
+    
+    await c.message.answer(out, parse_mode="Markdown")
+    await c.answer()
 
 @dp.callback_query(F.data == "apply_pr")
-async def pr1(c: CallbackQuery, state: FSMContext):
+async def process_pr_1(c: CallbackQuery, state: FSMContext):
     await state.set_state(PRApplication.age)
-    await c.message.answer("Заявка на PR.\n1. Твой возраст?")
+    await c.message.answer("📝 Заявка на PR.\nВаш возраст?")
 
 @dp.message(PRApplication.age)
-async def pr2(m: Message, state: FSMContext):
+async def process_pr_2(m: Message, state: FSMContext):
     await state.update_data(age=m.text)
     await state.set_state(PRApplication.nickname)
-    await m.answer("2. Ссылка на канал / ник?")
+    await m.answer("Ваша ссылка на канал или юзернейм?")
 
 @dp.message(PRApplication.nickname)
-async def pr3(m: Message, state: FSMContext):
+async def process_pr_3(m: Message, state: FSMContext):
     await state.update_data(nick=m.text)
     await state.set_state(PRApplication.proofs)
-    await m.answer("3. Скриншот статистики:")
+    await m.answer("Пришлите скриншот вашей статистики:")
 
-@dp.message(PRApplication.proofs, F.photo)
-async def pr4(m: Message, state: FSMContext):
-    d = await state.get_data()
-    info = (f"📩 **ЗАЯВКА PR**\n\n👤 От: @{m.from_user.username}\n🔞 Возраст: {d['age']}\n🔗 Канал: {d['nick']}")
-    if PR_CHAT_ID: await bot.send_photo(PR_CHAT_ID, m.photo[-1].file_id, caption=info)
-    await m.answer("✅ Отправлено!"); await state.clear()
+@dp.message(PRApplication.proofs, F.content_type == ContentType.PHOTO)
+async def process_pr_final(m: Message, state: FSMContext):
+    data = await state.get_data()
+    msg = (f"📩 **НОВАЯ ЗАЯВКА PR**\n\n"
+           f"👤 От: @{m.from_user.username}\n"
+           f"🔞 Возраст: {data['age']}\n"
+           f"🔗 Канал: {data['nick']}")
+    if PR_CHAT_ID:
+        await bot.send_photo(PR_CHAT_ID, m.photo[-1].file_id, caption=msg)
+    await m.answer("✅ Ваша заявка отправлена!")
+    await state.clear()
 
 @dp.callback_query(F.data.startswith("rev_"))
-async def rev1(c: CallbackQuery, state: FSMContext):
-    await state.update_data(rlid=c.data.split("_")[1])
+async def process_leave_review_start(c: CallbackQuery, state: FSMContext):
+    lot_id = c.data.split("_")[1]
+    await state.update_data(rev_lot_id=lot_id)
     await state.set_state(LeaveReview.text)
-    await c.message.answer("Твой отзыв о выигрыше:")
+    await c.message.answer("Пожалуйста, напишите ваш отзыв:")
 
 @dp.message(LeaveReview.text)
-async def rev2(m: Message, state: FSMContext):
-    d = await state.get_data()
-    db_query("INSERT INTO reviews (user_id, lot_id, text) VALUES (?,?,?)", (m.from_user.id, d['rlid'], m.text), commit=True)
-    await m.answer("✅ Спасибо!"); await state.clear()
+async def process_leave_review_final(m: Message, state: FSMContext):
+    data = await state.get_data()
+    db_query(
+        "INSERT INTO reviews (user_id, lot_id, text) VALUES (?,?,?)", 
+        (m.from_user.id, data['rev_lot_id'], m.text), 
+        commit=True
+    )
+    await m.answer("✅ Спасибо за ваш отзыв!")
+    await state.clear()
 
 @dp.callback_query(F.data == "to_start")
-async def back(c: CallbackQuery, state: FSMContext):
+async def process_to_start(c: CallbackQuery, state: FSMContext):
     await cmd_start(c.message, CommandObject(command="start"), state)
     await c.message.delete()
 
-# --- 10. ФОНОВЫЙ ЦИКЛ И ЗАПУСК ---
-
-async def scheduler():
+# =================================================================
+# 10. ФОНОВЫЙ ТАЙМЕР И ЗАПУСК
+# =================================================================
+async def time_monitor():
+    """Проверка лотерей по времени каждые 60 сек"""
     while True:
         try:
-            active = db_query("SELECT * FROM lotteries WHERE status='active' AND finish_type='time'", fetchall=True)
+            active_time_lots = db_query(
+                "SELECT * FROM lotteries WHERE status = 'active' AND finish_type = 'time'", 
+                fetchall=True
+            )
             now = datetime.now()
-            for l in active:
-                if now >= datetime.strptime(l['finish_value'], "%d.%m.%Y %H:%M"):
-                    await finish_lottery(l['id'])
-        except: pass
+            for lot in active_time_lots:
+                try:
+                    f_time = datetime.strptime(lot['finish_value'], "%d.%m.%Y %H:%M")
+                    if now >= f_time:
+                        await finalize_giveaway(lot['id'])
+                except:
+                    continue
+        except Exception as e:
+            logger.error(f"Ошибка в мониторе времени: {e}")
         await asyncio.sleep(60)
 
 async def main():
     init_db()
-    asyncio.create_task(scheduler())
+    # Запуск фонового процесса
+    asyncio.create_task(time_monitor())
+    
+    logger.info("Бот запускается...")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    except: pass
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
