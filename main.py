@@ -6,6 +6,7 @@ import json
 import asyncio
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -17,9 +18,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # --- 1. НАСТРОЙКИ ---
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
-# Получаем список админов и чистим от пробелов
+# Чистим ID админов от пробелов и пустых строк
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
-PR_CHAT_ID = int(os.getenv("PR_CHAT_ID", "0"))
+PR_CHAT_ID = os.getenv("PR_CHAT_ID", "0")
+PR_CHAT_ID = int(PR_CHAT_ID) if PR_CHAT_ID.lstrip("-").isdigit() else 0
 LOT_CHANNEL = os.getenv("LOT_CHANNEL", "@lotsvitechek")
 
 logging.basicConfig(level=logging.INFO)
@@ -50,9 +52,9 @@ def init_db():
         conn.commit()
 
 def db_query(query, params=(), fetchone=False, fetchall=False, commit=False):
-    """Универсальная функция для работы с БД"""
+    """Универсальная безопасная функция для БД"""
     with sqlite3.connect("bot_database.db") as conn:
-        conn.row_factory = sqlite3.Row
+        conn.row_factory = sqlite3.Row  # Позволяет обращаться к полям по имени
         cur = conn.cursor()
         cur.execute(query, params)
         if commit: conn.commit()
@@ -75,7 +77,7 @@ class PRApplication(StatesGroup):
 
 class AdminStates(StatesGroup):
     manual_count = State()
-    broadcast_text = State() # Добавил для рассылки
+    broadcast_text = State()
 
 # --- 4. УТИЛИТЫ ---
 async def check_user_subscription(user_id: int, channels: list) -> tuple:
@@ -88,22 +90,9 @@ async def check_user_subscription(user_id: int, channels: list) -> tuple:
                 not_subscribed.append(channel.strip())
         except Exception as e:
             logging.error(f"Ошибка проверки подписки {channel}: {e}")
-            not_subscribed.append(channel.strip())
+            # Если бот не админ в канале, считаем что подписан, чтобы не блочить
+            # not_subscribed.append(channel.strip()) 
     return len(not_subscribed) == 0, not_subscribed
-
-def format_time_remaining(finish_time: str) -> str:
-    try:
-        end_time = datetime.strptime(finish_time, "%d.%m.%Y %H:%M")
-        delta = end_time - datetime.now()
-        if delta.total_seconds() <= 0: return "Завершено"
-        
-        days = delta.days
-        hours = delta.seconds // 3600
-        minutes = (delta.seconds % 3600) // 60
-        
-        if days > 0: return f"{days}д. {hours}ч."
-        return f"{hours}ч. {minutes}м."
-    except: return "Неизвестно"
 
 # --- 5. ЛОГИКА ЗАВЕРШЕНИЯ ---
 async def finish_giveaway(lot_id: int, manual: bool = False):
@@ -129,7 +118,7 @@ async def finish_giveaway(lot_id: int, manual: bool = False):
 
     mention = f"@{winner['username']}" if winner['username'] else f"[{winner['full_name']}](tg://user?id={winner['user_id']})"
     
-    # Формируем список (до 10 человек для красоты)
+    # Список участников (первые 10)
     p_list = "\n".join([f"• @{p['username']}" if p['username'] else f"• {p['full_name']}" for p in participants[:10]])
     if len(participants) > 10: p_list += f"\n... и еще {len(participants)-10}"
 
@@ -141,7 +130,9 @@ async def finish_giveaway(lot_id: int, manual: bool = False):
             f"👥 **Участники:**\n{p_list}")
 
     try:
+        # Отправляем в канал
         await bot.send_message(LOT_CHANNEL, text, parse_mode="Markdown", reply_to_message_id=lot['message_id'])
+        # Отправляем победителю в ЛС
         await bot.send_message(winner['user_id'], f"🎉 Поздравляем! Вы победили в лотерее #{lot_id}!\n[Ссылка на пост](https://t.me/{LOT_CHANNEL.lstrip('@')}/{lot['message_id']})", parse_mode="Markdown")
     except Exception as e:
         logging.error(f"Ошибка отправки итогов: {e}")
@@ -155,7 +146,11 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
 
     # Если перешли по ссылке lot_ID
     if command.args and command.args.startswith("lot_"):
-        lot_id = int(command.args.split("_")[1])
+        try:
+            lot_id = int(command.args.split("_")[1])
+        except ValueError:
+            return await message.answer("⚠️ Неверная ссылка.")
+
         lot = db_query("SELECT * FROM lotteries WHERE id = ?", (lot_id,), fetchone=True)
         
         if not lot: return await message.answer("⚠️ Розыгрыш не найден!")
@@ -177,13 +172,16 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
         try:
             db_query("INSERT INTO participants (user_id, lot_id, username, full_name) VALUES (?,?,?,?)",
                      (user_id, lot_id, message.from_user.username, message.from_user.full_name), commit=True)
-            # Увеличиваем счетчик в лотерее
+            
+            # Увеличиваем счетчик
             db_query("UPDATE lotteries SET participants_count = participants_count + 1 WHERE id = ?", (lot_id,), commit=True)
             
-            # Проверка завершения по количеству
+            # Проверка мгновенного завершения (по количеству)
             if lot['finish_type'] == 'count' or lot['finish_type'] == 'both':
                 count = db_query("SELECT COUNT(*) as c FROM participants WHERE lot_id=?", (lot_id,), fetchone=True)['c']
-                target = int(lot['finish_value'].split('|')[0] if '|' in lot['finish_value'] else lot['finish_value'])
+                # Извлекаем числовую цель
+                target_str = lot['finish_value'].split('|')[0] if '|' in lot['finish_value'] else lot['finish_value']
+                target = int(target_str)
                 if count >= target:
                     await finish_giveaway(lot_id)
             
@@ -216,7 +214,7 @@ async def pr_age(message: Message, state: FSMContext):
     if not message.text.isdigit(): return await message.answer("Введите число!")
     await state.update_data(age=message.text)
     await state.set_state(PRApplication.nickname)
-    await message.answer("📝 Шаг 2: Укажите ваш никнейм/канал:")
+    await message.answer("📝 Шаг 2: Укажите сколько у вас чатов")
 
 @dp.message(PRApplication.nickname)
 async def pr_nick(message: Message, state: FSMContext):
@@ -228,10 +226,13 @@ async def pr_nick(message: Message, state: FSMContext):
 async def pr_proofs(message: Message, state: FSMContext):
     data = await state.get_data()
     caption = (f"📩 **Новая заявка PR**\n👤: {message.from_user.full_name} (@{message.from_user.username})\n"
-               f"🔞 Возраст: {data['age']}\n🔗 Канал: {data['nickname']}")
+               f"🔞 Возраст: {data['age']}\n🔗 Чатов: {data['nickname']}")
     
     if PR_CHAT_ID:
-        await bot.send_photo(PR_CHAT_ID, message.photo[-1].file_id, caption=caption)
+        try:
+            await bot.send_photo(PR_CHAT_ID, message.photo[-1].file_id, caption=caption)
+        except Exception as e:
+            logging.error(f"Ошибка отправки PR заявки: {e}")
     
     await message.answer("✅ Заявка отправлена!")
     await state.clear()
@@ -252,13 +253,21 @@ async def admin_panel(callback: CallbackQuery):
 @dp.callback_query(F.data == "admin_create", F.from_user.id.in_(ADMIN_IDS))
 async def create_init(callback: CallbackQuery, state: FSMContext):
     await state.set_state(CreateLot.text)
-    await callback.message.answer("1. Пришлите текст поста (можно с фото/видео, но лучше просто текст с разметкой):")
+    await callback.message.answer("1. Пришлите текст поста (можно с фото, но лучше просто текст с разметкой):")
     await callback.answer()
 
 @dp.message(CreateLot.text)
 async def create_text(message: Message, state: FSMContext):
-    ents = json.dumps([e.model_dump() for e in message.entities]) if message.entities else "[]"
-    await state.update_data(text=message.text, entities=ents)
+    # Исправленное сохранение: берем текст ИЛИ подпись к фото
+    text_content = message.text or message.caption or ""
+    
+    # Исправленное сохранение Entities для Pydantic v2 (aiogram 3.x)
+    raw_entities = message.entities or message.caption_entities or []
+    # Сериализуем через model_dump, так как объекты aiogram - это Pydantic модели
+    ents_json = json.dumps([e.model_dump(mode='json') for e in raw_entities])
+    
+    await state.update_data(text=text_content, entities=ents_json)
+    
     await state.set_state(CreateLot.channels)
     await message.answer("2. Каналы для подписки через запятую (или 'нет'):")
 
@@ -267,7 +276,6 @@ async def create_channels(message: Message, state: FSMContext):
     ch = "" if message.text.lower() == 'нет' else message.text
     await state.update_data(channels=ch)
     
-    # ИСПРАВЛЕННЫЕ КНОПКИ (были ошибки синтаксиса)
     kb = [
         [InlineKeyboardButton(text="⏰ По времени", callback_data="type_time")],
         [InlineKeyboardButton(text="👥 По количеству", callback_data="type_count")],
@@ -318,10 +326,16 @@ async def create_manual_val(message: Message, state: FSMContext):
     data = await state.get_data()
     val = message.text.strip()
     
-    if data['ftype'] == "count":
-        if not val.isdigit(): return await message.answer("Введите число!")
-        await finalize_lot(message, state, val)
-        return
+    # Если мы ждем количество
+    if data.get('ftype') == "count" or await state.get_state() == CreateLot.participants_count:
+         if not val.isdigit(): return await message.answer("Введите число!")
+         if data.get('ftype') == "both":
+             # Собираем Both: "КОЛИЧЕСТВО|ВРЕМЯ"
+             combined_val = f"{val}|{data['finish_val']}"
+             await finalize_lot(message, state, combined_val)
+         else:
+             await finalize_lot(message, state, val)
+         return
 
     # Если ручной ввод времени
     if ":" in val or val.isdigit():
@@ -329,6 +343,7 @@ async def create_manual_val(message: Message, state: FSMContext):
             if ":" in val: h, m = map(int, val.split(":"))
             else: h, m = int(val), 0
             f_time = (datetime.now() + timedelta(hours=h, minutes=m)).strftime("%d.%m.%Y %H:%M")
+            
             if data['ftype'] == "both":
                 await state.update_data(finish_val=f_time)
                 await message.answer("Теперь введите число участников:")
@@ -338,27 +353,44 @@ async def create_manual_val(message: Message, state: FSMContext):
         except: await message.answer("Ошибка формата!")
 
 @dp.message(CreateLot.participants_count)
-async def create_both_final(message: Message, state: FSMContext):
+async def create_both_final_handler(message: Message, state: FSMContext):
+    # Этот хендлер дублируется логикой в manual_count, но оставим для надежности
     if not message.text.isdigit(): return await message.answer("Число!")
     data = await state.get_data()
-    # Сохраняем как "КОЛИЧЕСТВО|ВРЕМЯ"
     combined_val = f"{message.text}|{data['finish_val']}"
     await finalize_lot(message, state, combined_val)
 
 async def finalize_lot(message, state, f_val):
     data = await state.get_data()
+    
+    # 1. Проверяем наличие текста, чтобы не упасть с NoneError
+    text_content = data.get('text', 'Описание отсутствует')
+    
+    # 2. Сохраняем в БД
     lot_id = db_query("INSERT INTO lotteries (text, entities, channels, finish_type, finish_value) VALUES (?,?,?,?,?)",
-                      (data['text'], data['entities'], data['channels'], data['ftype'], f_val), commit=True)
+                      (text_content, data.get('entities', '[]'), data.get('channels', ''), data.get('ftype', 'time'), f_val), commit=True)
     
     kb = [[InlineKeyboardButton(text="✅ Участвовать!", url=f"https://t.me/{(await bot.get_me()).username}?start=lot_{lot_id}")]]
     
-    # Восстановление форматирования
-    ents = [types.MessageEntity(**json.loads(e)) for e in json.loads(data['entities'])] if data['entities'] != "[]" else None
+    # 3. Восстанавливаем форматирование безопасно
+    ents = None
+    if data.get('entities') and data['entities'] != "[]":
+        try:
+            # Создаем объекты MessageEntity из JSON словарей
+            ents = [types.MessageEntity(**e) for e in json.loads(data['entities'])]
+        except Exception as e:
+            logging.error(f"Ошибка парсинга entities: {e}")
+            ents = None
+
+    try:
+        sent = await bot.send_message(LOT_CHANNEL, text_content, entities=ents, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        db_query("UPDATE lotteries SET message_id = ? WHERE id = ?", (sent.message_id, lot_id), commit=True)
+        await message.answer(f"✅ Лотерея #{lot_id} запущена!\nТип: {data.get('ftype')}\nУсловие: {f_val}")
+    except Exception as e:
+        await message.answer(f"❌ Ошибка отправки в канал: {e}")
+        # Удаляем лотерею из БД, раз пост не ушел
+        db_query("DELETE FROM lotteries WHERE id = ?", (lot_id,), commit=True)
     
-    sent = await bot.send_message(LOT_CHANNEL, data['text'], entities=ents, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
-    db_query("UPDATE lotteries SET message_id = ? WHERE id = ?", (sent.message_id, lot_id), commit=True)
-    
-    await message.answer(f"✅ Лотерея #{lot_id} запущена!\nТип: {data['ftype']}\nУсловие: {f_val}")
     await state.clear()
 
 # СПИСОК И УПРАВЛЕНИЕ
@@ -415,7 +447,7 @@ async def show_stats(callback: CallbackQuery):
     kb = [[InlineKeyboardButton(text="🔙 Назад", callback_data="admin_panel")]]
     await callback.message.edit_text(f"📊 Статистика:\n👥 Юзеров: {users}\n🎲 Лотерей всего: {lots}\n▶️ Активных: {active}", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-# РАССЫЛКА (Добавил, чтобы кнопка работала)
+# РАССЫЛКА
 @dp.callback_query(F.data == "admin_broadcast", F.from_user.id.in_(ADMIN_IDS))
 async def ask_broadcast(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer("Введите текст для рассылки всем пользователям:")
@@ -426,12 +458,14 @@ async def ask_broadcast(callback: CallbackQuery, state: FSMContext):
 async def do_broadcast(message: Message, state: FSMContext):
     users = db_query("SELECT user_id FROM users", fetchall=True)
     count = 0
+    await message.answer("🚀 Рассылка запущена...")
     for u in users:
         try:
             await bot.send_message(u['user_id'], message.text)
             count += 1
-            await asyncio.sleep(0.05) # Чтоб не забанили
-        except: pass
+            await asyncio.sleep(0.05) 
+        except Exception: 
+            pass # Игнорим ошибки (блок бота и тд)
     await message.answer(f"✅ Рассылка завершена. Доставлено: {count}")
     await state.clear()
 
@@ -448,7 +482,9 @@ async def user_list_active(callback: CallbackQuery):
     text = "🎁 Активные розыгрыши:\n"
     kb = InlineKeyboardBuilder()
     for l in lots:
-        text += f"#{l['id']} - {l['text'][:30]}...\n"
+        # Безопасный срез текста
+        short_text = (l['text'][:30] + '...') if l['text'] else f"Лотерея #{l['id']}"
+        text += f"#{l['id']} - {short_text}\n"
         kb.button(text=f"Участвовать #{l['id']}", url=f"https://t.me/{(await bot.get_me()).username}?start=lot_{l['id']}")
     kb.button(text="🔙 Назад", callback_data="back_menu")
     kb.adjust(1)
@@ -482,15 +518,11 @@ async def back_menu(callback: CallbackQuery):
 async def checker():
     while True:
         try:
-            # Получаем все активные лотереи
             lots = db_query("SELECT * FROM lotteries WHERE status = 'active'", fetchall=True)
             now = datetime.now()
             
             for lot in lots:
-                # Сколько сейчас людей
                 curr_users = db_query("SELECT COUNT(*) as c FROM participants WHERE lot_id=?", (lot['id'],), fetchone=True)['c']
-                
-                # Логика завершения
                 should_finish = False
                 
                 if lot['finish_type'] == 'count':
@@ -501,15 +533,11 @@ async def checker():
                     if now >= f_time: should_finish = True
                     
                 elif lot['finish_type'] == 'both':
-                    # Формат: "10|25.12.2025 15:00"
                     parts = lot['finish_value'].split('|')
                     target_count = int(parts[0])
                     target_time = datetime.strptime(parts[1], "%d.%m.%Y %H:%M")
                     
-                    # Если время вышло И набралось людей (или другое условие, как решишь)
-                    # Обычно в "И" нужно выполнение обоих условий, или завершение по дедлайну?
-                    # Сделаем: если время вышло, проверяем набралось ли людей. Если нет - просто закрываем или продлеваем?
-                    # В этом коде: завершаем если время вышло И людей хватает.
+                    # Условие: время вышло И людей достаточно
                     if now >= target_time and curr_users >= target_count:
                         should_finish = True
                 
@@ -519,14 +547,15 @@ async def checker():
         except Exception as e:
             logging.error(f"Ошибка в чекере: {e}")
         
-        await asyncio.sleep(30) # Проверка раз в 30 сек
+        await asyncio.sleep(30)
 
 # --- 11. СТАРТ ---
 async def main():
     init_db()
-    # Запускаем чекер в фоне
     asyncio.create_task(checker())
     try:
+        # Удаляем вебхук на всякий случай и запускаем
+        await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     except Exception as e:
         logging.error(f"Ошибка поллинга: {e}")
