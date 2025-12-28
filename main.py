@@ -180,14 +180,40 @@ async def cl_type(callback: CallbackQuery, state: FSMContext):
     await state.update_data(ftype=ftype)
     
     if ftype == "time":
-        kb = InlineKeyboardMarkup(inline_keyboard=[
+        kb =
+InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="1 минута", callback_data="val_1min"),
+InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="5 минут", callback_data="val_5min"),
+InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="10 минут", callback_data="val_10min"),
+InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=15 минут", callback_data="val_15min"),
+InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="30 минут", callback_data="val_30min"),
+InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="45 минут", callback_data="val_45min"),
+InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="1 час", callback_data="val_1h"), InlineKeyboardButton(text="3 часа", callback_data="val_3h")],
+InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="6 часов", callback_data="val_6h"),
+InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="12 часов", callback_data="val_12h"),
             [InlineKeyboardButton(text="1 день", callback_data="val_1d"), InlineKeyboardButton(text="3 дня", callback_data="val_3d")]
         ])
         await callback.message.edit_text("4. Через сколько завершить?", reply_markup=kb)
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="10 чел", callback_data="val_10"), InlineKeyboardButton(text="50 чел", callback_data="val_50")],
+            [InlineKeyboardButton(text="10 чел", callback_data="val_10"),
+InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="15 чел", callback_data="val_15"),
+InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="20 чел", callback_data="val_20"),
+InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="25 чел", callback_data="val_25"),
+InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="30 чел", callback_data="val_30"),
+InlineKeyboardButton(text="50 чел", callback_data="val_50")],
             [InlineKeyboardButton(text="100 чел", callback_data="val_100"), InlineKeyboardButton(text="500 чел", callback_data="val_500")]
         ])
         await callback.message.edit_text("4. Сколько участников собрать?", reply_markup=kb)
