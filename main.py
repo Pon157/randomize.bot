@@ -5,11 +5,11 @@ import logging
 import json
 import asyncio
 import sys
-import html # <--- ВАЖНО: Используем стандартную библиотеку
+import html as pyhtml # <--- ВАЖНО: Переименовали, чтобы не конфликтовало с aiogram
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
-# Убрали 'html' из импорта aiogram, чтобы не было конфликта
+# Исключаем 'html' из импортов aiogram
 from aiogram import Bot, Dispatcher, F, types 
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -32,7 +32,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     stream=sys.stdout
 )
-logger = logging.getLogger("LotteryMaster_FINAL")
+logger = logging.getLogger("LotteryMaster_FIXED")
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -240,7 +240,8 @@ async def run_final_selection(lot_id: int):
     for winner in winners_list:
         db_query("INSERT INTO winners (lot_id, user_id) VALUES (?,?)", (lot_id, winner['user_id']), commit=True)
         
-        safe_name = html.escape(winner['full_name'])
+        # ИСПОЛЬЗУЕМ pyhtml
+        safe_name = pyhtml.escape(winner['full_name'])
         mention = f"@{winner['username']}" if winner['username'] else f"<a href='tg://user?id={winner['user_id']}'>{safe_name}</a>"
         mentions.append(mention)
         
@@ -298,18 +299,19 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
             inviter = db_query("SELECT * FROM users WHERE user_id = ?", (ref_id,), fetchone=True)
             
             if inviter:
-                await message.answer(f"👋 Вы приглашены партнером: <b>{html.escape(inviter['full_name'])}</b>", parse_mode="HTML")
+                # ИСПОЛЬЗУЕМ pyhtml
+                await message.answer(f"👋 Вы приглашены партнером: <b>{pyhtml.escape(inviter['full_name'])}</b>", parse_mode="HTML")
                 try:
-                    await bot.send_message(ref_id, f"🤝 <b>У вас новый реферал!</b>\nПользователь: {html.escape(message.from_user.full_name)}", parse_mode="HTML")
+                    await bot.send_message(ref_id, f"🤝 <b>У вас новый реферал!</b>\nПользователь: {pyhtml.escape(message.from_user.full_name)}", parse_mode="HTML")
                 except: pass
                 
                 if PR_CHAT_ID:
                     try:
                         pr_report = (
                             f"📈 <b>НОВЫЙ РЕФЕРАЛ!</b>\n\n"
-                            f"👤 <b>Партнер:</b> {html.escape(inviter['full_name'])} (@{inviter['username'] or '---'})\n"
+                            f"👤 <b>Партнер:</b> {pyhtml.escape(inviter['full_name'])} (@{inviter['username'] or '---'})\n"
                             f"🆔 ID Партнера: <code>{ref_id}</code>\n\n"
-                            f"🆕 <b>Реферал:</b> {html.escape(message.from_user.full_name)} (@{message.from_user.username or '---'})\n"
+                            f"🆕 <b>Реферал:</b> {pyhtml.escape(message.from_user.full_name)} (@{message.from_user.username or '---'})\n"
                             f"🆔 ID Реферала: <code>{uid}</code>\n\n"
                             f"📊 <b>Итого приглашено:</b> {inviter['refs_count'] + 1}"
                         )
@@ -380,7 +382,8 @@ async def cmd_start(message: Message, command: CommandObject, state: FSMContext)
     if uid in ADMIN_IDS:
         kb.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_main")])
     
-    text_hello = f"👋 Привет, {html.escape(message.from_user.first_name)}!\nЯ бот для проведения честных розыгрышей.\nВыбирай действие в меню:"
+    # ИСПОЛЬЗУЕМ pyhtml
+    text_hello = f"👋 Привет, {pyhtml.escape(message.from_user.first_name)}!\nЯ бот для проведения честных розыгрышей.\nВыбирай действие в меню:"
     await message.answer(text_hello, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
 
 # =================================================================
@@ -429,7 +432,8 @@ async def process_view_reviews(c: CallbackQuery):
 
     text = "💬 <b>ОТЗЫВЫ ПОБЕДИТЕЛЕЙ:</b>\n\n"
     for r in reviews:
-        text += f"👤 <b>{html.escape(r['full_name'])}</b> (Лот #{r['lot_id']}):\n<i>{html.escape(r['text'])}</i>\n\n"
+        # ИСПОЛЬЗУЕМ pyhtml
+        text += f"👤 <b>{pyhtml.escape(r['full_name'])}</b> (Лот #{r['lot_id']}):\n<i>{pyhtml.escape(r['text'])}</i>\n\n"
     
     await c.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
 
@@ -481,7 +485,8 @@ async def show_refs_list(c: CallbackQuery):
     for i, r in enumerate(refs, 1):
         d = r['created_at'].split()[0]
         u = f"(@{r['username']})" if r['username'] else ""
-        text += f"{i}. {html.escape(r['full_name'])} {u} — {d}\n"
+        # ИСПОЛЬЗУЕМ pyhtml
+        text += f"{i}. {pyhtml.escape(r['full_name'])} {u} — {d}\n"
         
     await c.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
 
@@ -508,9 +513,9 @@ async def pr_finish(m: Message, state: FSMContext):
     
     if PR_CHAT_ID:
         caption = (f"📩 <b>НОВАЯ ЗАЯВКА PR</b>\n\n"
-                   f"👤 От: {html.escape(m.from_user.full_name)} (@{m.from_user.username})\n"
-                   f"🎂 Возраст: {html.escape(data['age'])}\n"
-                   f"🔗 Канал/Ник: {html.escape(data['nick'])}\n"
+                   f"👤 От: {pyhtml.escape(m.from_user.full_name)} (@{m.from_user.username})\n"
+                   f"🎂 Возраст: {pyhtml.escape(data['age'])}\n"
+                   f"🔗 Канал/Ник: {pyhtml.escape(data['nick'])}\n"
                    f"🆔 ID: <code>{m.from_user.id}</code>")
         try:
             await bot.send_photo(PR_CHAT_ID, m.photo[-1].file_id, caption=caption, parse_mode="HTML")
@@ -603,7 +608,7 @@ async def admin_manage_single(c: CallbackQuery):
         
     await c.message.edit_text(info, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
 
-# --- СПИСОК УЧАСТНИКОВ (ИСПРАВЛЕННЫЙ) ---
+# --- СПИСОК УЧАСТНИКОВ ---
 @dp.callback_query(F.data.startswith("listp_"))
 async def admin_show_participants(c: CallbackQuery):
     lid = int(c.data.split("_")[1])
@@ -613,7 +618,8 @@ async def admin_show_participants(c: CallbackQuery):
     text = f"👥 <b>Участники #{lid} (первые 60):</b>\n\n"
     for p in parts:
         nick = f"(@{p['username']})" if p['username'] else ""
-        safe_name = html.escape(p['full_name'])
+        # ИСПОЛЬЗУЕМ pyhtml
+        safe_name = pyhtml.escape(p['full_name'])
         text += f"• {safe_name} {nick} [<code>{p['user_id']}</code>]\n"
         
     await c.message.answer(text, parse_mode="HTML")
@@ -702,7 +708,8 @@ async def dm_user_send(m: Message, state: FSMContext):
     data = await state.get_data()
     target = data['target_id']
     try:
-        await bot.send_message(target, f"📩 <b>СООБЩЕНИЕ ОТ АДМИНИСТРАТОРА:</b>\n\n{html.escape(m.text)}", parse_mode="HTML")
+        # ИСПОЛЬЗУЕМ pyhtml
+        await bot.send_message(target, f"📩 <b>СООБЩЕНИЕ ОТ АДМИНИСТРАТОРА:</b>\n\n{pyhtml.escape(m.text)}", parse_mode="HTML")
         await m.answer("✅ Сообщение успешно отправлено!")
     except Exception as e:
         await m.answer(f"❌ Не удалось отправить (бот заблокирован?): {e}")
@@ -728,7 +735,8 @@ async def search_u_res(m: Message, state: FSMContext):
     p_stat = db_query("SELECT COUNT(*) as c FROM participants WHERE user_id = ?", (uid,), fetchone=True)['c']
     w_stat = db_query("SELECT COUNT(*) as c FROM winners WHERE user_id = ?", (uid,), fetchone=True)['c']
     
-    txt = (f"🕵️ <b>Info on {html.escape(u['full_name'])}</b>\n\n"
+    # ИСПОЛЬЗУЕМ pyhtml
+    txt = (f"🕵️ <b>Info on {pyhtml.escape(u['full_name'])}</b>\n\n"
            f"🆔 ID: <code>{uid}</code>\n"
            f"🔗 User: @{u['username']}\n"
            f"📅 Дата реги: {u['created_at']}\n"
