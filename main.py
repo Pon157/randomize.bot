@@ -5,10 +5,11 @@ import logging
 import json
 import asyncio
 import sys
-import html as pyhtml
+import html as pyhtml # <--- ВАЖНО: Переименовали, чтобы не конфликтовало с aiogram
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
+# Исключаем 'html' из импортов aiogram
 from aiogram import Bot, Dispatcher, F, types 
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
@@ -24,10 +25,14 @@ from aiogram.types import (
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # =================================================================
-# 1. СИСТЕМНЫЕ НАСТРОЙКИ
+# 1. СИСТЕМНЫЕ НАСТРОЙКИ И ЛОГИРОВАНИЕ
 # =================================================================
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("LotteryMaster_FULL")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stdout
+)
+logger = logging.getLogger("LotteryMaster_FIXED")
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -36,7 +41,7 @@ PR_CHAT_ID = int(os.getenv("PR_CHAT_ID", "0"))
 LOT_CHANNEL = os.getenv("LOT_CHANNEL", "@lotsvitechek")
 
 if not TOKEN:
-    logger.critical("❌ ОШИБКА: Токен не найден в .env!")
+    logger.critical("❌ ОШИБКА: Токен не найден в .env файле!")
     sys.exit(1)
 
 bot = Bot(token=TOKEN)
@@ -46,525 +51,838 @@ dp = Dispatcher(storage=MemoryStorage())
 # 2. БАЗА ДАННЫХ
 # =================================================================
 def init_db():
-    logger.info("Подключение к БД...")
+    logger.info("Подключение к базе данных...")
     conn = sqlite3.connect("bot_database.db")
     cur = conn.cursor()
     
-    # --- Таблицы Розыгрышей ---
-    cur.execute("""CREATE TABLE IF NOT EXISTS lotteries (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, entities TEXT, channels TEXT, 
-        finish_type TEXT, finish_value TEXT, status TEXT DEFAULT 'active', 
-        message_id INTEGER, photo TEXT, sticker TEXT, winners_count INTEGER DEFAULT 1, 
-        participants_count INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS lotteries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT,
+        entities TEXT,
+        channels TEXT,
+        finish_type TEXT,
+        finish_value TEXT,
+        status TEXT DEFAULT 'active',
+        message_id INTEGER,
+        photo TEXT,
+        sticker TEXT,
+        winners_count INTEGER DEFAULT 1,
+        participants_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
     
-    cur.execute("CREATE TABLE IF NOT EXISTS participants (user_id INTEGER, lot_id INTEGER, username TEXT, full_name TEXT, joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (user_id, lot_id))")
-    cur.execute("CREATE TABLE IF NOT EXISTS winners (lot_id INTEGER, user_id INTEGER, win_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS participants (
+        user_id INTEGER,
+        lot_id INTEGER,
+        username TEXT,
+        full_name TEXT,
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (user_id, lot_id)
+    )""")
     
-    # --- Таблица Юзеров ---
-    cur.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY, username TEXT, full_name TEXT, 
-        balance INTEGER DEFAULT 0, referrer_id INTEGER DEFAULT 0, 
-        refs_count INTEGER DEFAULT 0, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS winners (
+        lot_id INTEGER,
+        user_id INTEGER,
+        win_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
     
-    # --- Таблица Отзывов (с поддержкой типа отзыва) ---
-    cur.execute("""CREATE TABLE IF NOT EXISTS reviews (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, 
-        target_id INTEGER, type TEXT DEFAULT 'win', 
-        text TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        full_name TEXT,
+        referrer_id INTEGER DEFAULT 0,
+        refs_count INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
     
-    # --- Таблицы Покупок и Настроек ---
-    cur.execute("""CREATE TABLE IF NOT EXISTS orders (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, service TEXT, 
-        contact TEXT, links TEXT, status TEXT DEFAULT 'pending', 
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-    
-    cur.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
-    
-    # Проверка структуры и миграции
-    cur.execute("PRAGMA table_info(reviews)")
-    cols = [c[1] for c in cur.fetchall()]
-    if 'type' not in cols: cur.execute("ALTER TABLE reviews ADD COLUMN type TEXT DEFAULT 'win'")
-    if 'target_id' not in cols: cur.execute("ALTER TABLE reviews ADD COLUMN target_id INTEGER DEFAULT 0")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        lot_id INTEGER,
+        text TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )""")
 
-    # Дефолтные настройки
-    defaults = [
-        ('price_text', '📋 <b>Прайс-лист:</b>\n\n🔹 Обычная лота: 500р / 250 Stars\n👑 VIP: 1000р / 500 Stars'),
-        ('stars_link', 'https://t.me/change_me'),
-        ('da_link', 'https://www.donationalerts.com/r/change_me')
-    ]
-    cur.executemany("INSERT OR IGNORE INTO settings VALUES (?, ?)", defaults)
-    
+    cur.execute("PRAGMA table_info(users)")
+    cols = [c[1] for c in cur.fetchall()]
+    if 'referrer_id' not in cols: 
+        cur.execute("ALTER TABLE users ADD COLUMN referrer_id INTEGER DEFAULT 0")
+    if 'refs_count' not in cols: 
+        cur.execute("ALTER TABLE users ADD COLUMN refs_count INTEGER DEFAULT 0")
+
     conn.commit()
     conn.close()
+    logger.info("БД готова к работе.")
 
 def db_query(query, params=(), fetchone=False, fetchall=False, commit=False):
-    with sqlite3.connect("bot_database.db") as conn:
-        conn.row_factory = sqlite3.Row
-        cur = conn.cursor()
-        cur.execute(query, params)
-        if commit: conn.commit()
-        if fetchone: return cur.fetchone()
-        if fetchall: return cur.fetchall()
-        return cur.lastrowid
+    try:
+        with sqlite3.connect("bot_database.db") as conn:
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(query, params)
+            if commit: conn.commit()
+            if fetchone: return cur.fetchone()
+            if fetchall: return cur.fetchall()
+            return cur.lastrowid
+    except Exception as e:
+        logger.error(f"SQL Error: {e} | Query: {query}")
+        return None
 
 # =================================================================
 # 3. МАШИНА СОСТОЯНИЙ (FSM)
 # =================================================================
 class CreateLot(StatesGroup):
-    text, winners_count, channels, finish_type, value = State(), State(), State(), State(), State()
+    text = State()
+    winners_count = State()
+    channels = State()
+    finish_type = State()
+    value = State()
 
 class EditLotState(StatesGroup):
-    lot_id, field, new_value = State(), State(), State()
-
-class OrderService(StatesGroup):
-    choosing_service, entering_contact, entering_links = State(), State(), State()
-
-class AdminSettings(StatesGroup):
-    edit_key, new_value, refund_amount = State(), State(), State()
-
-class LeaveReview(StatesGroup):
-    target_id, type, text = State(), State(), State()
+    lot_id = State()
+    field_to_edit = State() 
+    new_value = State()
+    finish_type_cache = State()
 
 class PRApplication(StatesGroup):
-    age, nickname, proofs = State(), State(), State()
+    age = State()
+    nickname = State()
+    proofs = State()
 
-class AdminDM(StatesGroup):
-    user_id, text = State(), State()
+class LeaveReview(StatesGroup):
+    lot_id = State()
+    text = State()
 
-class AdminBroadcast(StatesGroup):
+class BroadcastState(StatesGroup):
     content = State()
 
+class AdminSearch(StatesGroup):
+    query = State()
+
+class AdminDM(StatesGroup):
+    user_id = State()
+    message_text = State()
+
 # =================================================================
-# 4. ЛОГИКА РОЗЫГРЫШЕЙ
+# 4. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # =================================================================
 async def check_user_sub(user_id: int, channels_str: str):
-    if not channels_str or channels_str.lower() in ['нет', 'none', '']: return True, []
+    if not channels_str or channels_str.lower() in ['нет', 'none', '']:
+        return True, []
+    
     not_subscribed = []
-    for channel in [c.strip() for c in channels_str.split(",") if c.strip()]:
+    channels_list = [c.strip() for c in channels_str.split(",") if c.strip()]
+    
+    for channel in channels_list:
         try:
             member = await bot.get_chat_member(channel, user_id)
-            if member.status in ["left", "kicked"]: not_subscribed.append(channel)
-        except: not_subscribed.append(channel)
+            if member.status in ["left", "kicked", "restricted"]:
+                if member.status == "restricted" and not member.is_member:
+                     not_subscribed.append(channel)
+                elif member.status in ["left", "kicked"]:
+                    not_subscribed.append(channel)
+        except Exception as e:
+            logger.warning(f"Ошибка проверки подписки {channel}: {e}")
+            not_subscribed.append(channel)
+            
     return len(not_subscribed) == 0, not_subscribed
 
 async def update_lot_card(lot_id: int, count: int):
     lot = db_query("SELECT message_id FROM lotteries WHERE id = ?", (lot_id,), fetchone=True)
-    if not lot or not lot['message_id']: return
+    if not lot or not lot['message_id']:
+        return
+
     me = await bot.get_me()
-    kb = InlineKeyboardBuilder().button(text=f"✅ Участвовать! ({count})", url=f"https://t.me/{me.username}?start=lot_{lot_id}").as_markup()
-    try: await bot.edit_message_reply_markup(chat_id=LOT_CHANNEL, message_id=lot['message_id'], reply_markup=kb)
-    except: pass
+    kb = InlineKeyboardBuilder()
+    kb.button(
+        text=f"✅ Участвовать! ({count})", 
+        url=f"https://t.me/{me.username}?start=lot_{lot_id}"
+    )
+    
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=LOT_CHANNEL, 
+            message_id=lot['message_id'], 
+            reply_markup=kb.as_markup()
+        )
+    except Exception as e:
+        logger.debug(f"Не удалось обновить кнопку: {e}")
 
 async def run_final_selection(lot_id: int):
+    logger.info(f"Запуск финализации лота #{lot_id}")
     lot = db_query("SELECT * FROM lotteries WHERE id = ?", (lot_id,), fetchone=True)
-    if not lot or lot['status'] != 'active': return
+    
+    if not lot:
+        return
     
     participants = db_query("SELECT * FROM participants WHERE lot_id = ?", (lot_id,), fetchall=True)
+    
+    # Закрываем лот
     db_query("UPDATE lotteries SET status = 'closed' WHERE id = ?", (lot_id,), commit=True)
     
     if not participants:
-        try: await bot.send_message(LOT_CHANNEL, f"⚠️ Лот #{lot_id} завершен без участников.", reply_to_message_id=lot['message_id'])
-        except: await bot.send_message(LOT_CHANNEL, f"⚠️ Лот #{lot_id} завершен без участников.")
+        try:
+            await bot.send_message(LOT_CHANNEL, f"⚠️ Розыгрыш #{lot_id} завершен. Участников не набралось.", reply_to_message_id=lot['message_id'])
+        except:
+            await bot.send_message(LOT_CHANNEL, f"⚠️ Розыгрыш #{lot_id} завершен. Участников не набралось.")
         return
 
-    winners = random.sample(participants, min(len(participants), lot['winners_count']))
+    # Выбор победителей
+    count_to_win = min(len(participants), lot['winners_count'])
+    winners_list = random.sample(participants, count_to_win)
+    
     mentions = []
-    for w in winners:
-        db_query("INSERT INTO winners (lot_id, user_id) VALUES (?,?)", (lot_id, w['user_id']), commit=True)
-        mention = f"@{w['username']}" if w['username'] else f"<a href='tg://user?id={w['user_id']}'>{pyhtml.escape(w['full_name'])}</a>"
+    for winner in winners_list:
+        db_query("INSERT INTO winners (lot_id, user_id) VALUES (?,?)", (lot_id, winner['user_id']), commit=True)
+        
+        # ИСПОЛЬЗУЕМ pyhtml
+        safe_name = pyhtml.escape(winner['full_name'])
+        mention = f"@{winner['username']}" if winner['username'] else f"<a href='tg://user?id={winner['user_id']}'>{safe_name}</a>"
         mentions.append(mention)
+        
         try:
-            kb = InlineKeyboardBuilder().button(text="✍️ Оставить отзыв", callback_data=f"rev_win_{lot_id}").as_markup()
-            await bot.send_message(w['user_id'], f"🎉 <b>ПОБЕДА!</b> Ты выиграл в лоте #{lot_id}!", reply_markup=kb, parse_mode="HTML")
-        except: pass
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✍️ Оставить отзыв", callback_data=f"rev_{lot_id}")]
+            ])
+            await bot.send_message(
+                winner['user_id'], 
+                f"🎉 ПОЗДРАВЛЯЕМ! Вы выиграли в розыгрыше #{lot_id}!\nСвяжитесь с администратором для получения приза.", 
+                reply_markup=kb
+            )
+        except Exception:
+            pass 
 
-    res_text = f"🎊 <b>ИТОГИ #{lot_id}</b>\n🏆 Победители: {', '.join(mentions)}"
-    try: await bot.send_message(LOT_CHANNEL, res_text, parse_mode="HTML", reply_to_message_id=lot['message_id'])
-    except: await bot.send_message(LOT_CHANNEL, res_text, parse_mode="HTML")
+    result_text = (
+        f"🎊 <b>ИТОГИ РОЗЫГРЫША #{lot_id}</b>\n\n"
+        f"🏆 Победители: {', '.join(mentions)}\n"
+        f"📊 Всего участников: {len(participants)}\n\n"
+        f"Победители получили инструкции в ЛС!"
+    )
+    
+    try:
+        await bot.send_message(LOT_CHANNEL, result_text, parse_mode="HTML", reply_to_message_id=lot['message_id'])
+    except Exception:
+        await bot.send_message(LOT_CHANNEL, result_text, parse_mode="HTML")
 
 # =================================================================
-# 5. СТАРТ И МЕНЮ
+# 5. START / РЕФЕРАЛЫ / УЧАСТИЕ
 # =================================================================
 @dp.message(Command("start"))
 async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
     uid = message.from_user.id
+    args = command.args
+    
     user = db_query("SELECT * FROM users WHERE user_id = ?", (uid,), fetchone=True)
-    
     if not user:
-        ref_id = int(command.args.replace("ref", "")) if command.args and command.args.startswith("ref") else 0
-        db_query("INSERT INTO users (user_id, username, full_name, referrer_id) VALUES (?,?,?,?)",
-                 (uid, message.from_user.username, message.from_user.full_name, ref_id), commit=True)
-        if ref_id: 
+        ref_id = 0
+        if args and args.startswith("ref"):
+            try:
+                possible_ref = int(args.replace("ref", ""))
+                if possible_ref != uid:
+                    ref_id = possible_ref
+            except:
+                ref_id = 0
+        
+        db_query(
+            "INSERT INTO users (user_id, username, full_name, referrer_id) VALUES (?,?,?,?)",
+            (uid, message.from_user.username, message.from_user.full_name, ref_id),
+            commit=True
+        )
+        
+        if ref_id != 0:
             db_query("UPDATE users SET refs_count = refs_count + 1 WHERE user_id = ?", (ref_id,), commit=True)
-            try: await bot.send_message(ref_id, "🤝 Новый реферал!")
-            except: pass
-
-    # Вход в лот
-    if command.args and command.args.startswith("lot_"):
-        try:
-            lid = int(command.args.split("_")[1])
-            lot = db_query("SELECT * FROM lotteries WHERE id=?", (lid,), fetchone=True)
-            if not lot or lot['status'] == 'closed': return await message.answer("❌ Лот не найден или завершен.")
+            inviter = db_query("SELECT * FROM users WHERE user_id = ?", (ref_id,), fetchone=True)
             
-            check = db_query("SELECT 1 FROM participants WHERE user_id=? AND lot_id=?", (uid, lid), fetchone=True)
-            if check: return await message.answer("⚠️ Вы уже участвуете.")
+            if inviter:
+                # ИСПОЛЬЗУЕМ pyhtml
+                await message.answer(f"👋 Вы приглашены партнером: <b>{pyhtml.escape(inviter['full_name'])}</b>", parse_mode="HTML")
+                try:
+                    await bot.send_message(ref_id, f"🤝 <b>У вас новый реферал!</b>\nПользователь: {pyhtml.escape(message.from_user.full_name)}", parse_mode="HTML")
+                except: pass
+                
+                if PR_CHAT_ID:
+                    try:
+                        pr_report = (
+                            f"📈 <b>НОВЫЙ РЕФЕРАЛ!</b>\n\n"
+                            f"👤 <b>Партнер:</b> {pyhtml.escape(inviter['full_name'])} (@{inviter['username'] or '---'})\n"
+                            f"🆔 ID Партнера: <code>{ref_id}</code>\n\n"
+                            f"🆕 <b>Реферал:</b> {pyhtml.escape(message.from_user.full_name)} (@{message.from_user.username or '---'})\n"
+                            f"🆔 ID Реферала: <code>{uid}</code>\n\n"
+                            f"📊 <b>Итого приглашено:</b> {inviter['refs_count'] + 1}"
+                        )
+                        await bot.send_message(PR_CHAT_ID, pr_report, parse_mode="HTML")
+                    except Exception as e:
+                        logger.error(f"Не удалось отправить отчет в PR чат: {e}")
 
-            is_sub, bad = await check_user_sub(uid, lot['channels'])
+    if args and args.startswith("lot_"):
+        try:
+            lot_id = int(args.split("_")[1])
+            lot = db_query("SELECT * FROM lotteries WHERE id = ?", (lot_id,), fetchone=True)
+            
+            if not lot:
+                return await message.answer("❌ Розыгрыш не найден.")
+            if lot['status'] == 'closed':
+                return await message.answer("❌ Этот розыгрыш уже завершен.")
+            
+            check_exist = db_query("SELECT 1 FROM participants WHERE user_id = ? AND lot_id = ?", (uid, lot_id), fetchone=True)
+            if check_exist:
+                return await message.answer(f"⚠️ Вы уже участвуете в лотерее #{lot_id}. Ожидайте результатов!")
+
+            is_sub, bad_channels = await check_user_sub(uid, lot['channels'])
             if not is_sub:
+                me = await bot.get_me()
                 kb = InlineKeyboardBuilder()
-                for c in bad: kb.button(text=f"Подписаться {c}", url=f"https://t.me/{c.replace('@','')}")
-                kb.button(text="🔄 Проверить", url=f"https://t.me/{(await bot.get_me()).username}?start=lot_{lid}")
+                for ch in bad_channels:
+                    clean_ch = ch.replace("@", "").strip()
+                    kb.button(text=f"📢 Подписаться на {ch}", url=f"https://t.me/{clean_ch}")
+                kb.button(text="🔄 ПРОВЕРИТЬ ПОДПИСКУ", url=f"https://t.me/{me.username}?start=lot_{lot_id}")
                 kb.adjust(1)
-                return await message.answer("⚠️ Подпишитесь на каналы:", reply_markup=kb.as_markup())
+                
+                return await message.answer(
+                    "⚠️ <b>Для участия необходимо подписаться на каналы:</b>", 
+                    reply_markup=kb.as_markup(),
+                    parse_mode="HTML"
+                )
 
-            db_query("INSERT INTO participants (user_id, lot_id, username, full_name) VALUES (?,?,?,?)", (uid, lid, message.from_user.username, message.from_user.full_name), commit=True)
-            cnt = db_query("SELECT COUNT(*) as c FROM participants WHERE lot_id=?", (lid,), fetchone=True)['c']
-            db_query("UPDATE lotteries SET participants_count=? WHERE id=?", (cnt, lid), commit=True)
-            await update_lot_card(lid, cnt)
-            await message.answer("✅ Вы участвуете!")
-            if lot['finish_type'] == 'count' and cnt >= int(lot['finish_value']): await run_final_selection(lid)
-            return
-        except: return await message.answer("Ошибка лота.")
+            try:
+                db_query(
+                    "INSERT INTO participants (user_id, lot_id, username, full_name) VALUES (?,?,?,?)",
+                    (uid, lot_id, message.from_user.username, message.from_user.full_name),
+                    commit=True
+                )
+            except sqlite3.IntegrityError:
+                return await message.answer("⚠️ Вы уже участвуете!")
 
-    await show_main_menu(message)
+            new_count_res = db_query("SELECT COUNT(*) as c FROM participants WHERE lot_id = ?", (lot_id,), fetchone=True)
+            new_count = new_count_res['c']
+            db_query("UPDATE lotteries SET participants_count = ? WHERE id = ?", (new_count, lot_id), commit=True)
+            
+            await update_lot_card(lot_id, new_count)
+            
+            if lot['finish_type'] == 'count' and new_count >= int(lot['finish_value']):
+                await run_final_selection(lot_id)
+            
+            return await message.answer(f"✅ <b>УСПЕХ!</b> Вы зарегистрированы в розыгрыше #{lot_id}. Удачи!", parse_mode="HTML")
 
-async def show_main_menu(message: Message):
-    user = db_query("SELECT balance FROM users WHERE user_id = ?", (message.from_user.id,), fetchone=True)
-    bal = user['balance'] if user else 0
-    kb = InlineKeyboardBuilder()
-    kb.button(text=f"💎 Купить рекламу/лот", callback_data="buy_service")
-    kb.button(text="📢 Розыгрыши", callback_data="active_lots")
-    kb.button(text="💬 Отзывы", callback_data="view_reviews")
-    kb.button(text="💼 Партнерка", callback_data="apply_pr")
-    kb.button(text="📊 Профиль", callback_data="my_stats")
-    if message.from_user.id in ADMIN_IDS: kb.button(text="🛠 Админка", callback_data="admin_main")
-    kb.adjust(1, 2, 2, 1)
-    await message.answer(f"👋 Привет! Баланс: <b>{bal}★</b>\nВыбери действие:", reply_markup=kb.as_markup(), parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Ошибка входа в лот: {e}")
+            return await message.answer("Произошла ошибка при регистрации. Попробуйте позже.")
+
+    kb = [
+        [InlineKeyboardButton(text="💬 Читать отзывы", callback_data="view_reviews"), 
+         InlineKeyboardButton(text="💼 Стать партнером", callback_data="apply_pr")],
+        [InlineKeyboardButton(text="📢 Активные розыгрыши", callback_data="active_lots"), 
+         InlineKeyboardButton(text="📊 Мой профиль", callback_data="my_stats")]
+    ]
+    if uid in ADMIN_IDS:
+        kb.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="admin_main")])
+    
+    # ИСПОЛЬЗУЕМ pyhtml
+    text_hello = f"👋 Привет, {pyhtml.escape(message.from_user.first_name)}!\nЯ бот для проведения честных розыгрышей.\nВыбирай действие в меню:"
+    await message.answer(text_hello, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
 
 # =================================================================
-# 6. СИСТЕМА ПОКУПКИ (ЗАКАЗЫ)
+# 6. ГЛАВНОЕ МЕНЮ
 # =================================================================
-@dp.callback_query(F.data == "buy_service")
-async def buy_start(c: CallbackQuery, state: FSMContext):
-    pt = db_query("SELECT value FROM settings WHERE key='price_text'", fetchone=True)['value']
+@dp.callback_query(F.data == "active_lots")
+async def process_active_lots(c: CallbackQuery):
+    lots = db_query("SELECT * FROM lotteries WHERE status = 'active' ORDER BY id DESC LIMIT 10", fetchall=True)
+    if not lots:
+        return await c.answer("На данный момент активных розыгрышей нет 😔", show_alert=True)
+    
+    text = "📢 <b>АКТИВНЫЕ РОЗЫГРЫШИ:</b>\n\n"
     kb = InlineKeyboardBuilder()
-    kb.button(text="🔹 Обычная лота", callback_data="svc_Обычная")
-    kb.button(text="👑 VIP Лота", callback_data="svc_VIP")
-    kb.button(text="🔙 Назад", callback_data="to_start")
-    kb.adjust(1, 1, 1)
-    await c.message.edit_text(f"{pt}\n\n⬇️ <b>Выберите услугу:</b>", reply_markup=kb.as_markup(), parse_mode="HTML")
-    await state.set_state(OrderService.choosing_service)
-
-@dp.callback_query(OrderService.choosing_service, F.data.startswith("svc_"))
-async def svc_chosen(c: CallbackQuery, state: FSMContext):
-    await state.update_data(svc=c.data.split("_")[1])
-    await c.message.answer("📝 Введите контакт для связи (@username):")
-    await state.set_state(OrderService.entering_contact)
-
-@dp.message(OrderService.entering_contact)
-async def contact_step(m: Message, state: FSMContext):
-    await state.update_data(cnt=m.text)
-    await m.answer("🔗 Пришлите ссылку на канал/бота:")
-    await state.set_state(OrderService.entering_links)
-
-@dp.message(OrderService.entering_links)
-async def links_step(m: Message, state: FSMContext):
-    d = await state.get_data()
-    oid = db_query("INSERT INTO orders (user_id, service, contact, links) VALUES (?,?,?,?)", 
-                   (m.from_user.id, d['svc'], d['cnt'], m.text), commit=True)
+    me = await bot.get_me()
     
-    akb = InlineKeyboardBuilder()
-    akb.button(text="✅ Принять", callback_data=f"ord_ok_{oid}_{m.from_user.id}")
-    akb.button(text="❌ Отклонить", callback_data=f"ord_no_{oid}_{m.from_user.id}")
-    
-    if PR_CHAT_ID:
-        msg = f"📩 <b>ЗАКАЗ #{oid}</b>\n👤: {m.from_user.mention_html()}\n💎: {d['svc']}\n📞: {d['cnt']}\n🔗: {m.text}"
-        await bot.send_message(PR_CHAT_ID, msg, reply_markup=akb.as_markup(), parse_mode="HTML")
-    
-    await m.answer("✅ Заявка отправлена модераторам!")
-    await state.clear()
+    for lot in lots:
+        text += f"🔹 <b>Лот #{lot['id']}</b>\n"
+        text += f"   🏆 Призовых мест: {lot['winners_count']}\n"
+        text += f"   👥 Участников: {lot['participants_count']}\n"
+        if lot['finish_type'] == 'time':
+            text += f"   ⏳ Финиш: {lot['finish_value']}\n"
+        else:
+            text += f"   🎯 Финиш: когда наберется {lot['finish_value']} чел.\n"
+        text += "-------------------\n"
+        kb.button(text=f"Перейти к Лоту #{lot['id']}", url=f"https://t.me/{me.username}?start=lot_{lot['id']}")
 
-# --- Обработка заказа Админом ---
-@dp.callback_query(F.data.startswith("ord_ok_"))
-async def adm_ord_ok(c: CallbackQuery):
-    _, _, oid, uid = c.data.split("_")
-    s_l = db_query("SELECT value FROM settings WHERE key='stars_link'", fetchone=True)['value']
-    d_l = db_query("SELECT value FROM settings WHERE key='da_link'", fetchone=True)['value']
-    
-    kb = InlineKeyboardBuilder()
-    kb.button(text="⭐ Оплата Stars", url=s_l)
-    kb.button(text="💳 DonationAlerts", url=d_l)
-    kb.button(text="✅ Я ОПЛАТИЛ", callback_data=f"cli_paid_{oid}")
+    kb.button(text="🔙 Назад в меню", callback_data="to_start")
     kb.adjust(1)
-    
-    await bot.send_message(uid, f"🎉 Заявка #{oid} одобрена! Оплатите и нажмите кнопку:", reply_markup=kb.as_markup())
-    await c.message.edit_text(f"{c.message.text}\n\n🟢 ОДОБРЕНО (Ждем оплату)")
-
-@dp.callback_query(F.data.startswith("cli_paid_"))
-async def client_paid(c: CallbackQuery):
-    oid = c.data.split("_")[2]
-    kb = InlineKeyboardBuilder().button(text="💰 Деньги пришли (Опубликовать)", callback_data=f"adm_fin_{oid}").as_markup()
-    if PR_CHAT_ID: await bot.send_message(PR_CHAT_ID, f"‼️ Юзер оплатил заказ #{oid}", reply_markup=kb)
-    await c.answer("Уведомление отправлено!")
-
-@dp.callback_query(F.data.startswith("adm_fin_"))
-async def adm_final(c: CallbackQuery):
-    oid = c.data.split("_")[2]
-    o = db_query("SELECT * FROM orders WHERE id=?", (oid,), fetchone=True)
-    if o:
-        # Публикация
-        txt = f"🎰 <b>НОВАЯ РЕКЛАМНАЯ ЛОТА</b>\n\n💎 Тип: {o['service']}\n🔗 Ссылка: {o['links']}\n👤 Заказчик: {o['contact']}"
-        await bot.send_message(LOT_CHANNEL, txt, parse_mode="HTML")
-        
-        # Кнопка отзыва
-        kb = InlineKeyboardBuilder().button(text="✍️ Оставить отзыв о покупке", callback_data=f"rev_ord_{oid}").as_markup()
-        await bot.send_message(o['user_id'], f"🚀 Ваша лота #{oid} опубликована! Теперь вы можете оставить отзыв.", reply_markup=kb)
-        
-        db_query("UPDATE orders SET status='published' WHERE id=?", (oid,), commit=True)
-    await c.message.edit_text(f"{c.message.text}\n\n✅ ОПУБЛИКОВАНО")
-
-@dp.callback_query(F.data.startswith("ord_no_"))
-async def adm_reject(c: CallbackQuery):
-    _, _, oid, uid = c.data.split("_")
-    kb = InlineKeyboardBuilder().button(text="💰 Возврат на баланс", callback_data=f"ref_{uid}_{oid}").as_markup()
-    await bot.send_message(uid, f"❌ Заявка #{oid} отклонена.")
-    await c.message.edit_text(f"{c.message.text}\n\n🔴 ОТКЛОНЕНО", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("ref_"))
-async def ref_start(c: CallbackQuery, state: FSMContext):
-    _, uid, oid = c.data.split("_")
-    await state.update_data(ruid=uid, roid=oid)
-    await c.message.answer("Сумма возврата (число):")
-    await state.set_state(AdminSettings.refund_amount)
-
-@dp.message(AdminSettings.refund_amount)
-async def ref_end(m: Message, state: FSMContext):
-    if not m.text.isdigit(): return
-    d = await state.get_data()
-    db_query("UPDATE users SET balance = balance + ? WHERE user_id = ?", (int(m.text), d['ruid']), commit=True)
-    await bot.send_message(d['ruid'], f"💰 Вам начислен возврат {m.text}★ за заказ #{d['roid']}")
-    await m.answer("✅ Возврат выполнен."); await state.clear()
-
-# =================================================================
-# 7. ОТЗЫВЫ (Универсальные)
-# =================================================================
-@dp.callback_query(F.data.startswith("rev_"))
-async def rev_start(c: CallbackQuery, state: FSMContext):
-    # rev_win_123 или rev_ord_45
-    p = c.data.split("_")
-    rtype, tid = p[1], p[2]
-    
-    # Проверка дубля
-    col = "target_id"
-    check = db_query(f"SELECT 1 FROM reviews WHERE user_id=? AND target_id=? AND type=?", (c.from_user.id, tid, rtype), fetchone=True)
-    if check: return await c.answer("Вы уже оставили отзыв!", show_alert=True)
-    
-    await state.update_data(rt=rtype, tid=tid)
-    await c.message.answer(f"✍️ Напишите ваш отзыв ({'о победе' if rtype=='win' else 'о покупке'}):")
-    await state.set_state(LeaveReview.text)
-
-@dp.message(LeaveReview.text)
-async def rev_save(m: Message, state: FSMContext):
-    d = await state.get_data()
-    db_query("INSERT INTO reviews (user_id, target_id, type, text) VALUES (?,?,?,?)", 
-             (m.from_user.id, d['tid'], d['rt'], m.text), commit=True)
-    await m.answer("✅ Отзыв опубликован!"); await state.clear()
+    await c.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
 
 @dp.callback_query(F.data == "view_reviews")
-async def show_reviews(c: CallbackQuery):
-    rvs = db_query("SELECT r.text, r.type, u.full_name FROM reviews r JOIN users u ON r.user_id=u.user_id ORDER BY r.id DESC LIMIT 10", fetchall=True)
-    kb = InlineKeyboardBuilder().button(text="🔙", callback_data="to_start").as_markup()
-    if not rvs: return await c.message.edit_text("Отзывов нет.", reply_markup=kb)
-    txt = "💬 <b>ОТЗЫВЫ:</b>\n\n"
-    for r in rvs:
-        icon = "🏆" if r['type']=='win' else "💎"
-        txt += f"{icon} <b>{pyhtml.escape(r['full_name'])}</b>:\n<i>{pyhtml.escape(r['text'])}</i>\n\n"
-    await c.message.edit_text(txt, reply_markup=kb, parse_mode="HTML")
+async def process_view_reviews(c: CallbackQuery):
+    reviews = db_query("""
+        SELECT r.text, r.lot_id, u.full_name 
+        FROM reviews r 
+        JOIN users u ON r.user_id = u.user_id 
+        ORDER BY r.id DESC LIMIT 10
+    """, fetchall=True)
+    
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Назад в меню", callback_data="to_start")
+    
+    if not reviews:
+        await c.message.edit_text("💬 Отзывов пока нет. Станьте первым победителем и напишите!", reply_markup=kb.as_markup())
+        return
+
+    text = "💬 <b>ОТЗЫВЫ ПОБЕДИТЕЛЕЙ:</b>\n\n"
+    for r in reviews:
+        # ИСПОЛЬЗУЕМ pyhtml
+        text += f"👤 <b>{pyhtml.escape(r['full_name'])}</b> (Лот #{r['lot_id']}):\n<i>{pyhtml.escape(r['text'])}</i>\n\n"
+    
+    await c.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "to_start")
+async def process_back_to_start(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try: await c.message.delete()
+    except: pass
+    await cmd_start(c.message, CommandObject(command="start"), state)
 
 # =================================================================
-# 8. АДМИН ПАНЕЛЬ
+# 7. ПРОФИЛЬ, РЕФЕРАЛЫ И ЗАЯВКА PR
+# =================================================================
+@dp.callback_query(F.data == "my_stats")
+async def show_profile(c: CallbackQuery):
+    uid = c.from_user.id
+    user = db_query("SELECT * FROM users WHERE user_id = ?", (uid,), fetchone=True)
+    p_cnt = db_query("SELECT COUNT(*) as c FROM participants WHERE user_id = ?", (uid,), fetchone=True)['c']
+    w_cnt = db_query("SELECT COUNT(*) as c FROM winners WHERE user_id = ?", (uid,), fetchone=True)['c']
+    
+    me = await bot.get_me()
+    ref_link = f"https://t.me/{me.username}?start=ref{uid}"
+    
+    msg = (f"👤 <b>ЛИЧНЫЙ КАБИНЕТ</b>\n\n"
+           f"🆔 ID: <code>{uid}</code>\n"
+           f"🎫 Участий в лотах: <b>{p_cnt}</b>\n"
+           f"🏆 Побед: <b>{w_cnt}</b>\n"
+           f"👥 Рефералов: <b>{user['refs_count']}</b>\n\n"
+           f"🔗 <b>Твоя ссылка для друзей:</b>\n<code>{ref_link}</code>")
+    
+    kb = [
+        [InlineKeyboardButton(text="👥 Мои рефералы", callback_data="my_refs_list")],
+        [InlineKeyboardButton(text="🔙 В меню", callback_data="to_start")]
+    ]
+    await c.message.edit_text(msg, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+@dp.callback_query(F.data == "my_refs_list")
+async def show_refs_list(c: CallbackQuery):
+    uid = c.from_user.id
+    refs = db_query("SELECT full_name, username, created_at FROM users WHERE referrer_id = ? ORDER BY created_at DESC LIMIT 40", (uid,), fetchall=True)
+    
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔙 Назад", callback_data="my_stats")
+    
+    if not refs:
+        return await c.message.edit_text("😔 Вы еще никого не пригласили.", reply_markup=kb.as_markup())
+    
+    text = "👥 <b>ВАШИ РЕФЕРАЛЫ (Топ 40):</b>\n\n"
+    for i, r in enumerate(refs, 1):
+        d = r['created_at'].split()[0]
+        u = f"(@{r['username']})" if r['username'] else ""
+        # ИСПОЛЬЗУЕМ pyhtml
+        text += f"{i}. {pyhtml.escape(r['full_name'])} {u} — {d}\n"
+        
+    await c.message.edit_text(text, reply_markup=kb.as_markup(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "apply_pr")
+async def pr_step1(c: CallbackQuery, state: FSMContext):
+    await state.set_state(PRApplication.age)
+    await c.message.edit_text("📝 <b>ЗАЯВКА НА СОТРУДНИЧЕСТВО</b>\n\n1. Напишите ваш возраст:", parse_mode="HTML")
+
+@dp.message(PRApplication.age)
+async def pr_step2(m: Message, state: FSMContext):
+    await state.update_data(age=m.text)
+    await state.set_state(PRApplication.nickname)
+    await m.answer("2. Пришлите ссылку на ваш канал или ваш юзернейм:")
+
+@dp.message(PRApplication.nickname)
+async def pr_step3(m: Message, state: FSMContext):
+    await state.update_data(nick=m.text)
+    await state.set_state(PRApplication.proofs)
+    await m.answer("3. Пришлите скриншот статистики канала (картинкой):")
+
+@dp.message(PRApplication.proofs, F.content_type == ContentType.PHOTO)
+async def pr_finish(m: Message, state: FSMContext):
+    data = await state.get_data()
+    
+    if PR_CHAT_ID:
+        caption = (f"📩 <b>НОВАЯ ЗАЯВКА PR</b>\n\n"
+                   f"👤 От: {pyhtml.escape(m.from_user.full_name)} (@{m.from_user.username})\n"
+                   f"🎂 Возраст: {pyhtml.escape(data['age'])}\n"
+                   f"🔗 Канал/Ник: {pyhtml.escape(data['nick'])}\n"
+                   f"🆔 ID: <code>{m.from_user.id}</code>")
+        try:
+            await bot.send_photo(PR_CHAT_ID, m.photo[-1].file_id, caption=caption, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Ошибка отправки PR заявки: {e}")
+
+    await m.answer("✅ Заявка успешно отправлена администраторам!")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("rev_"))
+async def review_start(c: CallbackQuery, state: FSMContext):
+    lot_id = c.data.split("_")[1]
+    is_win = db_query("SELECT 1 FROM winners WHERE user_id = ? AND lot_id = ?", (c.from_user.id, lot_id), fetchone=True)
+    if not is_win:
+        return await c.answer("Вы не являетесь победителем этого розыгрыша!", show_alert=True)
+        
+    await state.update_data(target_lot=lot_id)
+    await state.set_state(LeaveReview.text)
+    await c.message.answer(f"✍️ Напишите ваш отзыв о розыгрыше #{lot_id}:")
+
+@dp.message(LeaveReview.text)
+async def review_finish(m: Message, state: FSMContext):
+    data = await state.get_data()
+    lot_id = data['target_lot']
+    db_query("INSERT INTO reviews (user_id, lot_id, text) VALUES (?,?,?)", 
+             (m.from_user.id, lot_id, m.text), commit=True)
+    await m.answer("✅ Спасибо! Ваш отзыв сохранен.")
+    await state.clear()
+
+# =================================================================
+# 8. АДМИН-ПАНЕЛЬ
 # =================================================================
 @dp.callback_query(F.data == "admin_main")
-async def adm_main(c: CallbackQuery):
-    if c.from_user.id not in ADMIN_IDS: return
+async def admin_main_menu(c: CallbackQuery):
+    if c.from_user.id not in ADMIN_IDS: return await c.answer("⛔ Доступ запрещен")
+    
     kb = [
-        [InlineKeyboardButton(text="➕ Создать Лот", callback_data="adm_create")],
-        [InlineKeyboardButton(text="📝 Лоты", callback_data="adm_lots"), InlineKeyboardButton(text="📨 Рассылка", callback_data="adm_br")],
-        [InlineKeyboardButton(text="💲 Прайс", callback_data="set_edit_price_text"), InlineKeyboardButton(text="⭐ Stars URL", callback_data="set_edit_stars_link")],
-        [InlineKeyboardButton(text="💳 DA URL", callback_data="set_edit_da_link")],
-        [InlineKeyboardButton(text="🔙", callback_data="to_start")]
+        [InlineKeyboardButton(text="➕ Создать лот", callback_data="adm_create")],
+        [InlineKeyboardButton(text="📝 Управление лотами", callback_data="adm_manage_lots")],
+        [InlineKeyboardButton(text="🔍 Поиск (ID/@user)", callback_data="adm_search_user")],
+        [InlineKeyboardButton(text="📩 Написать в ЛС", callback_data="adm_dm_user")],
+        [InlineKeyboardButton(text="📨 Рассылка", callback_data="adm_broadcast")],
+        [InlineKeyboardButton(text="🔙 В меню", callback_data="to_start")]
     ]
-    await c.message.edit_text("🛠 <b>АДМИНКА</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+    await c.message.edit_text("🛠 <b>АДМИН ПАНЕЛЬ</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
 
-# --- Редактор настроек ---
-@dp.callback_query(F.data.startswith("set_edit_"))
-async def adm_set_start(c: CallbackQuery, state: FSMContext):
-    k = c.data.replace("set_edit_", "")
-    await state.update_data(k=k)
-    await c.message.answer(f"Введите новое значение для {k}:")
-    await state.set_state(AdminSettings.new_value)
+# --- СПИСОК ЛОТОВ ---
+@dp.callback_query(F.data == "adm_manage_lots")
+async def admin_list_lots(c: CallbackQuery):
+    lots = db_query("SELECT * FROM lotteries ORDER BY id DESC LIMIT 20", fetchall=True)
+    builder = InlineKeyboardBuilder()
+    if not lots:
+        await c.answer("Нет лотов", show_alert=True)
+    else:
+        for l in lots:
+            status_emoji = "🟢" if l['status'] == 'active' else "🔴"
+            builder.button(text=f"{status_emoji} #{l['id']} (Уч: {l['participants_count']})", callback_data=f"manage_{l['id']}")
+            
+    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="🔙 Назад", callback_data="admin_main"))
+    await c.message.edit_text("📝 <b>ВЫБЕРИТЕ ЛОТ:</b>", reply_markup=builder.as_markup(), parse_mode="HTML")
 
-@dp.message(AdminSettings.new_value)
-async def adm_set_save(m: Message, state: FSMContext):
-    d = await state.get_data()
-    val = m.html_text if d['k']=='price_text' else m.text
-    db_query("REPLACE INTO settings (key, value) VALUES (?,?)", (d['k'], val), commit=True)
-    await m.answer("✅ Сохранено"); await state.clear()
+# --- УПРАВЛЕНИЕ ЛОТОМ ---
+@dp.callback_query(F.data.startswith("manage_"))
+async def admin_manage_single(c: CallbackQuery):
+    lid = int(c.data.split("_")[1])
+    l = db_query("SELECT * FROM lotteries WHERE id = ?", (lid,), fetchone=True)
+    if not l: return await c.answer("Лот не найден", show_alert=True)
 
-# --- Создание лота ---
+    info = (f"⚙️ <b>НАСТРОЙКИ ЛОТА #{lid}</b>\n\n"
+            f"Статус: <b>{l['status']}</b>\n"
+            f"👥 Участников: <b>{l['participants_count']}</b>\n"
+            f"🏆 Победителей: <b>{l['winners_count']}</b>\n"
+            f"🏁 Тип финиша: <b>{l['finish_type']}</b>\n"
+            f"🎯 Значение: <b>{l['finish_value']}</b>\n"
+            f"📢 Каналы: <code>{l['channels']}</code>")
+            
+    kb = [
+        [InlineKeyboardButton(text="👥 Список участников", callback_data=f"listp_{lid}")],
+        [InlineKeyboardButton(text="🏆 Изм. кол-во победителей", callback_data=f"edit_w_{lid}")],
+        [InlineKeyboardButton(text="⏳ Изм. финиш", callback_data=f"edit_f_{lid}")],
+        [InlineKeyboardButton(text="📢 Изм. каналы", callback_data=f"edit_s_{lid}")],
+        [InlineKeyboardButton(text="🛑 ЗАВЕРШИТЬ СЕЙЧАС", callback_data=f"stop_{lid}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_manage_lots")]
+    ]
+    
+    # Если лот завершен, добавляем кнопку перевыбора
+    if l['status'] == 'closed':
+        kb.insert(4, [InlineKeyboardButton(text="🔄 ПЕРЕВЫБРАТЬ ПОБЕДИТЕЛЕЙ", callback_data=f"reroll_{lid}")])
+        
+    await c.message.edit_text(info, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+# --- СПИСОК УЧАСТНИКОВ ---
+@dp.callback_query(F.data.startswith("listp_"))
+async def admin_show_participants(c: CallbackQuery):
+    lid = int(c.data.split("_")[1])
+    parts = db_query("SELECT full_name, user_id, username FROM participants WHERE lot_id = ? LIMIT 60", (lid,), fetchall=True)
+    if not parts: return await c.answer("Нет участников.", show_alert=True)
+    
+    text = f"👥 <b>Участники #{lid} (первые 60):</b>\n\n"
+    for p in parts:
+        nick = f"(@{p['username']})" if p['username'] else ""
+        # ИСПОЛЬЗУЕМ pyhtml
+        safe_name = pyhtml.escape(p['full_name'])
+        text += f"• {safe_name} {nick} [<code>{p['user_id']}</code>]\n"
+        
+    await c.message.answer(text, parse_mode="HTML")
+    await c.answer()
+
+# --- ПЕРЕВЫБОР ПОБЕДИТЕЛЕЙ ---
+@dp.callback_query(F.data.startswith("reroll_"))
+async def reroll_winners_handler(c: CallbackQuery):
+    lid = int(c.data.split("_")[1])
+    # Очищаем старых победителей
+    db_query("DELETE FROM winners WHERE lot_id = ?", (lid,), commit=True)
+    # Временно активируем статус (в памяти), но run_final_selection сама поставит closed
+    await c.answer("🔄 Перевыбираем...", show_alert=True)
+    await run_final_selection(lid)
+
+# --- РЕДАКТИРОВАНИЕ ---
+@dp.callback_query(F.data.startswith("edit_w_"))
+async def edit_winners_init(c: CallbackQuery, state: FSMContext):
+    lid = int(c.data.split("_")[2])
+    await state.update_data(lot_id=lid, field="winners_count")
+    await state.set_state(EditLotState.new_value)
+    await c.message.answer(f"Введите новое количество победителей для лота #{lid}:")
+
+@dp.callback_query(F.data.startswith("edit_f_"))
+async def edit_finish_init(c: CallbackQuery, state: FSMContext):
+    lid = int(c.data.split("_")[2])
+    lot = db_query("SELECT finish_type FROM lotteries WHERE id = ?", (lid,), fetchone=True)
+    await state.update_data(lot_id=lid, field="finish_value", ftype=lot['finish_type'])
+    await state.set_state(EditLotState.new_value)
+    prompt = "Введите новое время (в часах от сейчас):" if lot['finish_type'] == 'time' else "Введите новое кол-во участников:"
+    await c.message.answer(prompt)
+
+@dp.callback_query(F.data.startswith("edit_s_"))
+async def edit_subs_init(c: CallbackQuery, state: FSMContext):
+    lid = int(c.data.split("_")[2])
+    await state.update_data(lot_id=lid, field="channels")
+    await state.set_state(EditLotState.new_value)
+    await c.message.answer("Новый список каналов (@a, @b) или 'нет':")
+
+@dp.message(EditLotState.new_value)
+async def save_edited_value(m: Message, state: FSMContext):
+    data = await state.get_data()
+    lid = data['lot_id']
+    field = data['field']
+    val = m.text
+    
+    if field == "winners_count":
+        if not val.isdigit(): return await m.answer("Введите число!")
+        final_val = int(val)
+        
+    elif field == "finish_value":
+        if not val.isdigit(): return await m.answer("Введите число!")
+        if data.get('ftype') == 'time':
+            final_val = (datetime.now() + timedelta(hours=int(val))).strftime("%d.%m.%Y %H:%M")
+        else:
+            final_val = int(val)
+    elif field == "channels":
+        final_val = val
+    
+    db_query(f"UPDATE lotteries SET {field} = ? WHERE id = ?", (final_val, lid), commit=True)
+    await m.answer(f"✅ Лот #{lid} обновлен!")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("stop_"))
+async def force_stop_lot(c: CallbackQuery):
+    lid = int(c.data.split("_")[1])
+    await run_final_selection(lid)
+    await c.answer("Лот остановлен!", show_alert=True)
+    await admin_list_lots(c)
+
+# --- ЛС ПОЛЬЗОВАТЕЛЮ ---
+@dp.callback_query(F.data == "adm_dm_user")
+async def dm_user_start(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminDM.user_id)
+    await c.message.answer("🆔 Введите ID пользователя, которому хотите написать:")
+
+@dp.message(AdminDM.user_id)
+async def dm_user_id_input(m: Message, state: FSMContext):
+    if not m.text.isdigit(): return await m.answer("❌ ID должен быть числом.")
+    await state.update_data(target_id=int(m.text))
+    await state.set_state(AdminDM.message_text)
+    await m.answer("📩 Введите текст сообщения:")
+
+@dp.message(AdminDM.message_text)
+async def dm_user_send(m: Message, state: FSMContext):
+    data = await state.get_data()
+    target = data['target_id']
+    try:
+        # ИСПОЛЬЗУЕМ pyhtml
+        await bot.send_message(target, f"📩 <b>СООБЩЕНИЕ ОТ АДМИНИСТРАТОРА:</b>\n\n{pyhtml.escape(m.text)}", parse_mode="HTML")
+        await m.answer("✅ Сообщение успешно отправлено!")
+    except Exception as e:
+        await m.answer(f"❌ Не удалось отправить (бот заблокирован?): {e}")
+    await state.clear()
+
+# --- ПОИСК ---
+@dp.callback_query(F.data == "adm_search_user")
+async def search_u_init(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminSearch.query)
+    await c.message.answer("Введите ID или @username пользователя:")
+
+@dp.message(AdminSearch.query)
+async def search_u_res(m: Message, state: FSMContext):
+    q = m.text.replace("@", "").strip()
+    if q.isdigit():
+        u = db_query("SELECT * FROM users WHERE user_id = ?", (int(q),), fetchone=True)
+    else:
+        u = db_query("SELECT * FROM users WHERE username = ?", (q,), fetchone=True)
+        
+    if not u: return await m.answer("❌ Пользователь не найден.")
+    
+    uid = u['user_id']
+    p_stat = db_query("SELECT COUNT(*) as c FROM participants WHERE user_id = ?", (uid,), fetchone=True)['c']
+    w_stat = db_query("SELECT COUNT(*) as c FROM winners WHERE user_id = ?", (uid,), fetchone=True)['c']
+    
+    # ИСПОЛЬЗУЕМ pyhtml
+    txt = (f"🕵️ <b>Info on {pyhtml.escape(u['full_name'])}</b>\n\n"
+           f"🆔 ID: <code>{uid}</code>\n"
+           f"🔗 User: @{u['username']}\n"
+           f"📅 Дата реги: {u['created_at']}\n"
+           f"🎲 Участий: {p_stat} | 🏆 Побед: {w_stat}\n"
+           f"👥 Привел рефералов: {u['refs_count']}")
+           
+    await m.answer(txt, parse_mode="HTML")
+    await state.clear()
+
+# --- РАССЫЛКА ---
+@dp.callback_query(F.data == "adm_broadcast")
+async def broad_start(c: CallbackQuery, state: FSMContext):
+    await state.set_state(BroadcastState.content)
+    await c.message.answer("Пришлите пост для рассылки (Текст/Фото):")
+
+@dp.message(BroadcastState.content)
+async def broad_run(m: Message, state: FSMContext):
+    users = db_query("SELECT user_id FROM users", fetchall=True)
+    await m.answer(f"🚀 Старт рассылки на {len(users)} чел...")
+    good = 0
+    bad = 0
+    for u in users:
+        try:
+            await m.copy_to(u['user_id'])
+            good += 1
+            await asyncio.sleep(0.05)
+        except:
+            bad += 1
+    await m.answer(f"🏁 Рассылка завершена.\n✅ Доставлено: {good}\n❌ Блок/Ошибки: {bad}")
+    await state.clear()
+
+# =================================================================
+# 9. СОЗДАНИЕ ЛОТА (WIZARD)
+# =================================================================
 @dp.callback_query(F.data == "adm_create")
-async def cr_1(c: CallbackQuery, state: FSMContext):
-    await state.set_state(CreateLot.text); await c.message.answer("1. Пост (Текст/Фото):")
+async def create_1(c: CallbackQuery, state: FSMContext):
+    await state.set_state(CreateLot.text)
+    await c.message.answer("1. Отправьте пост для канала (Текст, Фото+Подпись, Стикер):")
 
 @dp.message(CreateLot.text)
-async def cr_2(m: Message, state: FSMContext):
+async def create_2(m: Message, state: FSMContext):
     ents = json.dumps([e.model_dump(mode='json') for e in (m.entities or m.caption_entities or [])])
-    pd = {"text": m.caption or m.text or "", "ent": ents, "ph": m.photo[-1].file_id if m.photo else None}
-    await state.update_data(pd=pd)
-    await state.set_state(CreateLot.winners_count); await m.answer("2. Победителей:")
+    pdata = {
+        "text": m.caption or m.text or "",
+        "entities": ents,
+        "photo": m.photo[-1].file_id if m.photo else None,
+        "sticker": m.sticker.file_id if m.sticker else None
+    }
+    await state.update_data(post=pdata)
+    await state.set_state(CreateLot.winners_count)
+    await m.answer("2. Количество победителей (число):")
 
 @dp.message(CreateLot.winners_count)
-async def cr_3(m: Message, state: FSMContext):
-    if not m.text.isdigit(): return
+async def create_3(m: Message, state: FSMContext):
+    if not m.text.isdigit(): return await m.answer("Число!")
     await state.update_data(wc=int(m.text))
-    await state.set_state(CreateLot.channels); await m.answer("3. Каналы (@a,@b) или нет:")
+    await state.set_state(CreateLot.channels)
+    await m.answer("3. Каналы для подписки через запятую (@a, @b) или 'нет':")
 
 @dp.message(CreateLot.channels)
-async def cr_4(m: Message, state: FSMContext):
+async def create_4(m: Message, state: FSMContext):
     await state.update_data(ch=m.text)
-    kb = InlineKeyboardBuilder(); kb.button(text="Время", callback_data="ft_time"); kb.button(text="Люди", callback_data="ft_count")
-    await m.answer("4. Тип финиша:", reply_markup=kb.as_markup())
+    kb = InlineKeyboardBuilder()
+    kb.button(text="⏰ По времени", callback_data="ft_time")
+    kb.button(text="👥 По кол-ву участников", callback_data="ft_count")
+    await m.answer("4. Условие завершения:", reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data.startswith("ft_"))
-async def cr_5(c: CallbackQuery, state: FSMContext):
-    t = "time" if c.data=="ft_time" else "count"
-    await state.update_data(ft=t)
-    await c.message.edit_text("Часов?" if t=="time" else "Сколько людей?")
+async def create_5(c: CallbackQuery, state: FSMContext):
+    ft = "time" if c.data == "ft_time" else "count"
+    await state.update_data(ftype=ft)
+    prompt = "Через сколько ЧАСОВ завершить?" if ft == "time" else "При скольки УЧАСТНИКАХ завершить?"
+    await c.message.edit_text(prompt)
     await state.set_state(CreateLot.value)
 
 @dp.message(CreateLot.value)
-async def cr_fin(m: Message, state: FSMContext):
-    if not m.text.isdigit(): return
-    d = await state.get_data()
-    val = (datetime.now()+timedelta(hours=int(m.text))).strftime("%d.%m.%Y %H:%M") if d['ft']=="time" else int(m.text)
-    lid = db_query("INSERT INTO lotteries (text, entities, channels, finish_type, finish_value, photo, winners_count) VALUES (?,?,?,?,?,?,?)",
-             (d['pd']['text'], d['pd']['ent'], d['ch'], d['ft'], val, d['pd']['ph'], d['wc']), commit=True)
+async def create_finish(m: Message, state: FSMContext):
+    if not m.text.isdigit(): return await m.answer("Число!")
+    data = await state.get_data()
+    post = data['post']
+    
+    if data['ftype'] == 'time':
+        f_val = (datetime.now() + timedelta(hours=int(m.text))).strftime("%d.%m.%Y %H:%M")
+    else:
+        f_val = int(m.text)
+        
+    lid = db_query(
+        """INSERT INTO lotteries (text, entities, channels, finish_type, finish_value, photo, sticker, winners_count) 
+           VALUES (?,?,?,?,?,?,?,?)""",
+        (post['text'], post['entities'], data['ch'], data['ftype'], f_val, post['photo'], post['sticker'], data['wc']),
+        commit=True
+    )
+    
     me = await bot.get_me()
-    kb = InlineKeyboardBuilder().button(text="✅ Участвовать!", url=f"https://t.me/{me.username}?start=lot_{lid}").as_markup()
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Участвовать! (0)", url=f"https://t.me/{me.username}?start=lot_{lid}")
+    
     try:
-        if d['pd']['ph']: sent = await bot.send_photo(LOT_CHANNEL, d['pd']['ph'], caption=d['pd']['text'], reply_markup=kb)
-        else: sent = await bot.send_message(LOT_CHANNEL, d['pd']['text'], reply_markup=kb)
-        db_query("UPDATE lotteries SET message_id=? WHERE id=?", (sent.message_id, lid), commit=True)
-        await m.answer("✅ Опубликовано!")
-    except Exception as e: await m.answer(f"Err: {e}")
+        if post['photo']:
+            sent = await bot.send_photo(LOT_CHANNEL, post['photo'], caption=post['text'], reply_markup=kb.as_markup())
+        elif post['sticker']:
+            await bot.send_sticker(LOT_CHANNEL, post['sticker'])
+            sent = await bot.send_message(LOT_CHANNEL, "🎁 Новый розыгрыш! Жми кнопку ниже.", reply_markup=kb.as_markup())
+        else:
+            sent = await bot.send_message(LOT_CHANNEL, post['text'], reply_markup=kb.as_markup())
+            
+        db_query("UPDATE lotteries SET message_id = ? WHERE id = ?", (sent.message_id, lid), commit=True)
+        await m.answer(f"✅ Лот #{lid} опубликован!")
+        
+    except Exception as e:
+        await m.answer(f"❌ Ошибка публикации: {e}\nЛот создан в базе, но не в канале.")
+        
     await state.clear()
-
-# --- Рассылка ---
-@dp.callback_query(F.data == "adm_br")
-async def br_1(c: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminBroadcast.content); await c.message.answer("Пост:")
-@dp.message(AdminBroadcast.content)
-async def br_2(m: Message, state: FSMContext):
-    u = db_query("SELECT user_id FROM users", fetchall=True)
-    await m.answer(f"Рассылка {len(u)}...")
-    for x in u:
-        try: await m.copy_to(x['user_id']); await asyncio.sleep(0.05)
-        except: pass
-    await m.answer("Готово"); await state.clear()
-
-# --- Управление лотами ---
-@dp.callback_query(F.data == "adm_lots")
-async def m_lots(c: CallbackQuery):
-    l = db_query("SELECT * FROM lotteries ORDER BY id DESC LIMIT 10", fetchall=True)
-    kb = InlineKeyboardBuilder()
-    for x in l: kb.button(text=f"#{x['id']} ({x['status']})", callback_data=f"man_{x['id']}")
-    kb.button(text="🔙", callback_data="admin_main"); kb.adjust(1)
-    await c.message.edit_text("Лоты:", reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data.startswith("man_"))
-async def m_one(c: CallbackQuery):
-    lid = c.data.split("_")[1]
-    kb = InlineKeyboardBuilder().button(text="🛑 СТОП", callback_data=f"stop_{lid}").button(text="🔙", callback_data="adm_lots").adjust(1).as_markup()
-    await c.message.edit_text(f"Лот #{lid}", reply_markup=kb)
-
-@dp.callback_query(F.data.startswith("stop_"))
-async def stop_l(c: CallbackQuery):
-    lid = int(c.data.split("_")[1])
-    await run_final_selection(lid)
-    await c.answer("Остановлено")
 
 # =================================================================
-# 9. ОСТАЛЬНОЕ
+# 10. ЗАПУСК И ФОНОВЫЕ ЗАДАЧИ
 # =================================================================
-@dp.callback_query(F.data == "to_start")
-async def back(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await c.message.delete(); await cmd_start(c.message, CommandObject(command="start"), state)
-
-@dp.callback_query(F.data == "active_lots")
-async def act(c: CallbackQuery):
-    l = db_query("SELECT * FROM lotteries WHERE status='active' LIMIT 10", fetchall=True)
-    if not l: return await c.answer("Пусто", show_alert=True)
-    kb = InlineKeyboardBuilder()
-    me = await bot.get_me()
-    for x in l: kb.button(text=f"Лот #{x['id']}", url=f"https://t.me/{me.username}?start=lot_{x['id']}")
-    kb.button(text="🔙", callback_data="to_start"); kb.adjust(1)
-    await c.message.edit_text("Активные:", reply_markup=kb.as_markup())
-
-@dp.callback_query(F.data == "my_stats")
-async def stats(c: CallbackQuery):
-    u = db_query("SELECT * FROM users WHERE user_id=?", (c.from_user.id,), fetchone=True)
-    p = db_query("SELECT COUNT(*) as c FROM participants WHERE user_id=?", (c.from_user.id,), fetchone=True)['c']
-    w = db_query("SELECT COUNT(*) as c FROM winners WHERE user_id=?", (c.from_user.id,), fetchone=True)['c']
-    me = await bot.get_me()
-    t = f"👤 ID: {c.from_user.id}\nУчастий: {p} | Побед: {w}\nРефералов: {u['refs_count']}\n🔗 `https://t.me/{me.username}?start=ref{c.from_user.id}`"
-    kb = InlineKeyboardBuilder().button(text="🔙", callback_data="to_start").as_markup()
-    await c.message.edit_text(t, reply_markup=kb, parse_mode="HTML")
-
-@dp.callback_query(F.data == "apply_pr")
-async def pr_1(c: CallbackQuery, state: FSMContext):
-    await state.set_state(PRApplication.age); await c.message.edit_text("Возраст?")
-@dp.message(PRApplication.age)
-async def pr_2(m: Message, state: FSMContext):
-    await state.update_data(age=m.text); await state.set_state(PRApplication.nickname); await m.answer("Ссылка/Ник?")
-@dp.message(PRApplication.nickname)
-async def pr_3(m: Message, state: FSMContext):
-    await state.update_data(nick=m.text); await state.set_state(PRApplication.proofs); await m.answer("Скрин статы:")
-@dp.message(PRApplication.proofs, F.content_type == ContentType.PHOTO)
-async def pr_4(m: Message, state: FSMContext):
-    d = await state.get_data()
-    if PR_CHAT_ID: await bot.send_photo(PR_CHAT_ID, m.photo[-1].file_id, caption=f"PR заявка\n{m.from_user.mention_html()}\nAge: {d['age']}\nLink: {d['nick']}")
-    await m.answer("✅ Отправлено"); await state.clear()
-
-# --- ЛС юзеру (админ) ---
-@dp.callback_query(F.data == "adm_dm_user")
-async def dm_1(c: CallbackQuery, state: FSMContext):
-    if c.from_user.id not in ADMIN_IDS: return
-    await state.set_state(AdminDM.user_id); await c.message.answer("ID юзера:")
-@dp.message(AdminDM.user_id)
-async def dm_2(m: Message, state: FSMContext):
-    await state.update_data(uid=m.text); await state.set_state(AdminDM.text); await m.answer("Текст:")
-@dp.message(AdminDM.text)
-async def dm_3(m: Message, state: FSMContext):
-    d = await state.get_data()
-    try: await bot.send_message(d['uid'], f"📩 <b>Админ:</b>\n{m.text}", parse_mode="HTML"); await m.answer("✅")
-    except: await m.answer("❌")
-    await state.clear()
-
 async def time_monitor():
+    logger.info("Монитор времени запущен")
     while True:
         try:
             lots = db_query("SELECT * FROM lotteries WHERE status='active' AND finish_type='time'", fetchall=True)
-            for l in lots:
-                if datetime.now() >= datetime.strptime(l['finish_value'], "%d.%m.%Y %H:%M"): await run_final_selection(l['id'])
-        except: pass
+            now = datetime.now()
+            for lot in lots:
+                try:
+                    f_time = datetime.strptime(lot['finish_value'], "%d.%m.%Y %H:%M")
+                    if now >= f_time:
+                        await run_final_selection(lot['id'])
+                except ValueError:
+                    logger.error(f"Неверный формат даты в лоте #{lot['id']}")
+        except Exception as e:
+            logger.error(f"Ошибка в мониторе: {e}")
         await asyncio.sleep(60)
 
 async def main():
     init_db()
     asyncio.create_task(time_monitor())
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    logger.info("Бот запущен и готов к работе!")
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Критическая ошибка поллинга: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот остановлен.")
